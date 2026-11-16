@@ -56,6 +56,11 @@ ureq = { version = "3", default-features = false, features = ["native-tls", "gzi
 # needs no C compiler or CMake (unlike `zlib-ng`).
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 
+# `neyuki pkg` reads the registry's JSON answers with `serde_json` (already
+# in the tree through other crates); package archives are plain ustar +
+# gzip, written and read by src/pkg/tarball.rs on top of `flate2`.
+serde_json = "1"
+
 # `@neyuki/crypto` is built on the RustCrypto / dalek crates, which cover
 # every algorithm it exposes (including RSA key generation, bcrypt and
 # argon2, which `ring` lacks). These are all from the digest-0.10 /
