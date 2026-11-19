@@ -83,8 +83,58 @@ impl ControlFlowGraph {
         self.find_block(self.entry_label)
     }
 
+    /// True when the CFG consists of a single entry block with no incoming or
+    /// outgoing edges and no jump/loop instructions. Inspects the block's
+    /// instructions directly so a stale `successors` list on a self-looping
+    /// block can never falsely trigger single-block shortcuts.
+    pub fn is_single_acyclic_block(&self) -> bool {
+        if self.blocks.len() != 1 {
+            return false;
+        }
+        let block = &self.blocks[0];
+        block.label == self.entry_label
+            && block.successors.is_empty()
+            && block.predecessors.is_empty()
+            && !block
+                .instructions
+                .iter()
+                .any(|inst| inst.jump_target().is_some())
+    }
+
+    /// Returns whether `flat` matches the exact flat instruction sequence that
+    /// `to_flat_instructions()` would produce, without allocating. Used by
+    /// codegen to verify a cached `func.cfg` is still in sync with
+    /// `func.instructions` before reusing it for register allocation.
+    pub fn matches_flat_instructions(&self, flat: &[IrInst]) -> bool {
+        let mut idx = 0;
+        for (i, block) in self.blocks.iter().enumerate() {
+            if flat.get(idx) != Some(&IrInst::Label(block.label)) {
+                return false;
+            }
+            idx += 1;
+            let next_label = self.blocks.get(i + 1).map(|b| b.label);
+            let n = block.instructions.len();
+            for (j, inst) in block.instructions.iter().enumerate() {
+                if j + 1 == n
+                    && let IrInst::Jump(target) = inst
+                    && Some(*target) == next_label
+                {
+                    continue;
+                }
+                if !matches!(inst, IrInst::Label(_)) {
+                    if flat.get(idx) != Some(inst) {
+                        return false;
+                    }
+                    idx += 1;
+                }
+            }
+        }
+        idx == flat.len()
+    }
+
     pub fn to_flat_instructions(&self) -> Vec<IrInst> {
-        let mut out = Vec::new();
+        let cap: usize = self.blocks.iter().map(|b| b.instructions.len() + 1).sum();
+        let mut out = Vec::with_capacity(cap);
         for (i, block) in self.blocks.iter().enumerate() {
             out.push(IrInst::Label(block.label));
             let next_label = self.blocks.get(i + 1).map(|b| b.label);

@@ -1,10 +1,9 @@
 //! Splits a linear IR sequence into a control flow graph.
 
-use std::collections::{HashMap, HashSet};
-
 use crate::compiler::ir::block::{BasicBlock, ControlFlowGraph};
 use crate::compiler::ir::inst::{IrInst, SpreadSink};
 use crate::compiler::ir::types::IrLabel;
+use crate::vm::hash::{FxHashMap, with_capacity};
 
 pub fn build_cfg(instructions: &[IrInst]) -> ControlFlowGraph {
     if instructions.is_empty() {
@@ -15,13 +14,13 @@ pub fn build_cfg(instructions: &[IrInst]) -> ControlFlowGraph {
     }
 
     // 1. Identify block leaders (entry, label targets, instructions following jumps)
-    let mut leaders = HashSet::new();
-    leaders.insert(0); // first instruction is always a leader
+    let mut is_leader = vec![false; instructions.len()];
+    is_leader[0] = true; // first instruction is always a leader
 
     for (idx, inst) in instructions.iter().enumerate() {
         match inst {
             IrInst::Label(_) => {
-                leaders.insert(idx);
+                is_leader[idx] = true;
             }
             IrInst::Jump(_)
             | IrInst::JumpIfFalse { .. }
@@ -31,7 +30,7 @@ pub fn build_cfg(instructions: &[IrInst]) -> ControlFlowGraph {
             | IrInst::TForLoop { .. }
                 if idx + 1 < instructions.len() =>
             {
-                leaders.insert(idx + 1);
+                is_leader[idx + 1] = true;
             }
             _ => {}
         }
@@ -40,7 +39,6 @@ pub fn build_cfg(instructions: &[IrInst]) -> ControlFlowGraph {
     // 2. Partition instructions into basic blocks
     let mut blocks: Vec<BasicBlock> = Vec::new();
     let mut current_block: Option<BasicBlock> = None;
-    let mut label_map: HashMap<IrLabel, usize> = HashMap::new();
     // Auto labels start above every label already in the stream. A CFG that
     // was flattened and rebuilt carries the previous round's auto labels as
     // real `Label` instructions, and minting from 900_000 again would hand
@@ -52,13 +50,13 @@ pub fn build_cfg(instructions: &[IrInst]) -> ControlFlowGraph {
         if let IrInst::Label(lbl) = inst {
             auto_label_id = auto_label_id.max(lbl.0);
         }
-        for target in inst.jump_targets() {
+        if let Some(target) = inst.jump_target() {
             auto_label_id = auto_label_id.max(target.0);
         }
     }
 
     for (idx, inst) in instructions.iter().enumerate() {
-        if leaders.contains(&idx) {
+        if is_leader[idx] {
             if let Some(blk) = current_block.take() {
                 blocks.push(blk);
             }
@@ -95,6 +93,7 @@ pub fn build_cfg(instructions: &[IrInst]) -> ControlFlowGraph {
         return cfg;
     }
 
+    let mut label_map: FxHashMap<IrLabel, usize> = with_capacity(blocks.len());
     for (i, b) in blocks.iter().enumerate() {
         label_map.insert(b.label, i);
     }

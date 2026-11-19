@@ -1,10 +1,9 @@
 //! The scope stack.
 
-use std::collections::HashMap;
-
 use crate::ast::ty::TypeExpr;
 use crate::diagnostics::span::Span;
 use crate::sema::symbol::Symbol;
+use crate::vm::hash::{FxHashMap, new_map};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScopeKind {
@@ -22,18 +21,18 @@ pub struct TypeAlias {
 
 pub struct Scope {
     pub kind: ScopeKind,
-    pub symbols: HashMap<String, Symbol>,
+    pub symbols: FxHashMap<String, Symbol>,
     /// Type names live apart from variables: `type Point` and `local Point`
     /// may both exist.
-    pub types: HashMap<String, TypeAlias>,
+    pub types: FxHashMap<String, TypeAlias>,
 }
 
 impl Scope {
     pub fn new(kind: ScopeKind) -> Self {
         Self {
             kind,
-            symbols: HashMap::new(),
-            types: HashMap::new(),
+            symbols: new_map(),
+            types: new_map(),
         }
     }
 }

@@ -1,16 +1,55 @@
 //! Linear scan register allocation from IR variables to the 256 VM
 //! registers.
 
-use std::collections::{BTreeSet, HashMap};
-
 use crate::compiler::ir::block::ControlFlowGraph;
 use crate::compiler::ir::inst::IrInst;
 use crate::compiler::ir::liveness::LivenessInfo;
 use crate::compiler::ir::types::IrVar;
+use crate::vm::hash::{FxHashMap, new_map, with_capacity};
+
+/// Fixed-capacity 256-bit register bitset backed by four `u64` words.
+/// Avoids heap allocations and finds the lowest free register in O(1).
+#[derive(Clone, Copy, Default)]
+struct RegSet([u64; 4]);
+
+impl RegSet {
+    fn from_range(start: u8, end_exclusive: u8) -> Self {
+        let mut set = Self::default();
+        for reg in start..end_exclusive {
+            set.insert(reg);
+        }
+        set
+    }
+
+    #[inline]
+    fn insert(&mut self, reg: u8) {
+        self.0[(reg >> 6) as usize] |= 1u64 << (reg & 63);
+    }
+
+    #[inline]
+    fn remove(&mut self, reg: u8) {
+        self.0[(reg >> 6) as usize] &= !(1u64 << (reg & 63));
+    }
+
+    #[inline]
+    fn contains(&self, reg: u8) -> bool {
+        (self.0[(reg >> 6) as usize] & (1u64 << (reg & 63))) != 0
+    }
+
+    #[inline]
+    fn lowest(&self) -> Option<u8> {
+        for (idx, &word) in self.0.iter().enumerate() {
+            if word != 0 {
+                return Some(((idx as u8) << 6) | (word.trailing_zeros() as u8));
+            }
+        }
+        None
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RegisterAllocation {
-    pub mapping: HashMap<IrVar, u8>,
+    pub mapping: FxHashMap<IrVar, u8>,
     pub max_registers: u8,
 }
 
@@ -33,14 +72,16 @@ pub fn allocate_registers(
     // register must not be handed to anything else once the variable's last
     // read goes by: the closure would see whatever overwrote it.
     let captured = crate::compiler::ir::opt::captured_vars(cfg);
-    for interval in &mut intervals {
-        if captured.contains(&interval.var) {
-            interval.end = usize::MAX;
+    if !captured.is_empty() {
+        for interval in &mut intervals {
+            if captured.contains(&interval.var) {
+                interval.end = usize::MAX;
+            }
         }
     }
 
     // Collect copy hints for register coalescing
-    let mut copy_hints: HashMap<IrVar, Vec<IrVar>> = HashMap::new();
+    let mut copy_hints: FxHashMap<IrVar, Vec<IrVar>> = new_map();
     for block in &cfg.blocks {
         for inst in &block.instructions {
             match inst {
@@ -65,7 +106,7 @@ pub fn allocate_registers(
     // allocation does not depend on hash order.
     intervals.sort_by_key(|intv| (intv.start, intv.end, intv.var.0));
 
-    let mut mapping: HashMap<IrVar, u8> = HashMap::new();
+    let mut mapping: FxHashMap<IrVar, u8> = with_capacity(intervals.len() + num_params as usize);
 
     // 1. Pre-allocate parameter registers: 0..num_params
     for i in 0..num_params {
@@ -73,7 +114,7 @@ pub fn allocate_registers(
     }
 
     // 2. Linear scan register allocation with coalescing
-    let mut free_registers: BTreeSet<u8> = (num_params..255).collect();
+    let mut free_registers = RegSet::from_range(num_params, 255);
     // Active intervals: (end_point, register, IrVar)
     let mut active: Vec<(usize, u8, IrVar)> = Vec::new();
     let mut max_reg = num_params;
@@ -114,13 +155,13 @@ pub fn allocate_registers(
                 mapping
                     .get(partner)
                     .copied()
-                    .filter(|&r| free_registers.contains(&r))
+                    .filter(|&r| free_registers.contains(r))
             })
         });
 
         let chosen_reg = if let Some(pref) = preferred_reg {
             pref
-        } else if let Some(&lowest) = free_registers.iter().next() {
+        } else if let Some(lowest) = free_registers.lowest() {
             lowest
         } else {
             return Err(format!(
@@ -129,7 +170,7 @@ pub fn allocate_registers(
             ));
         };
 
-        free_registers.remove(&chosen_reg);
+        free_registers.remove(chosen_reg);
         mapping.insert(interval.var, chosen_reg);
         active.push((interval.end, chosen_reg, interval.var));
         if chosen_reg.saturating_add(1) > max_reg {
@@ -141,4 +182,40 @@ pub fn allocate_registers(
         mapping,
         max_registers: max_reg,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RegSet;
+
+    #[test]
+    fn test_regset_word_boundaries_and_lowest() {
+        let mut set = RegSet::from_range(2, 255);
+        assert!(!set.contains(0));
+        assert!(!set.contains(1));
+        assert!(set.contains(2));
+        assert!(set.contains(63));
+        assert!(set.contains(64));
+        assert!(set.contains(127));
+        assert!(set.contains(128));
+        assert!(set.contains(191));
+        assert!(set.contains(192));
+        assert!(set.contains(254));
+        assert!(!set.contains(255));
+
+        for expected in 2..255u8 {
+            assert_eq!(set.lowest(), Some(expected));
+            set.remove(expected);
+            assert!(!set.contains(expected));
+        }
+        assert_eq!(set.lowest(), None);
+
+        set.insert(192);
+        set.insert(64);
+        assert_eq!(set.lowest(), Some(64));
+        set.remove(64);
+        assert_eq!(set.lowest(), Some(192));
+        set.remove(192);
+        assert_eq!(set.lowest(), None);
+    }
 }

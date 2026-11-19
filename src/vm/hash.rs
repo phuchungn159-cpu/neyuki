@@ -78,6 +78,16 @@ impl Hasher for FxHasher {
     }
 
     #[inline]
+    fn write_u16(&mut self, i: u16) {
+        self.add_to_hash(i as u64);
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.add_to_hash(i as u64);
+    }
+
+    #[inline]
     fn write_u64(&mut self, i: u64) {
         self.add_to_hash(i);
     }

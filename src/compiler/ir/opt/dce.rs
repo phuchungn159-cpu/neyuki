@@ -1,11 +1,10 @@
 //! Dead code and unreachable block removal.
 
-use std::collections::HashSet;
-
-use crate::compiler::ir::block::{ControlFlowGraph, IrModule};
+use crate::compiler::ir::block::{BasicBlock, ControlFlowGraph, IrModule};
 use crate::compiler::ir::inst::IrInst;
 use crate::compiler::ir::liveness::LivenessInfo;
 use crate::compiler::ir::types::IrVar;
+use crate::vm::hash::{FxHashSet, new_set};
 
 pub fn is_pure_instruction(inst: &IrInst) -> bool {
     matches!(
@@ -20,9 +19,96 @@ pub fn is_pure_instruction(inst: &IrInst) -> bool {
     )
 }
 
+fn dce_block(
+    block: &mut BasicBlock,
+    mut live_now: FxHashSet<IrVar>,
+    captured: &FxHashSet<IrVar>,
+) -> bool {
+    // Forward pass: indices of stores with statically-nil values.
+    // Clearing a register is GC-observable (it releases whatever
+    // reference the register may still hold), so a nil-store is
+    // never dead code — even when its target is never read again
+    // (the explicit-release idiom `t = nil`). Chains like
+    // `v10 = nil; v1 = v10` propagate nil-ness forward.
+    let mut nil_stores: FxHashSet<usize> = new_set();
+    if block
+        .instructions
+        .iter()
+        .any(|inst| matches!(inst, IrInst::LoadNil { .. }))
+    {
+        let mut nil_known: FxHashSet<IrVar> = new_set();
+        for (idx, inst) in block.instructions.iter().enumerate() {
+            match inst {
+                IrInst::LoadNil { dst } => {
+                    nil_known.insert(*dst);
+                    nil_stores.insert(idx);
+                }
+                IrInst::Move { dst, src } => {
+                    nil_known.remove(dst);
+                    if nil_known.contains(src) {
+                        nil_known.insert(*dst);
+                        nil_stores.insert(idx);
+                    }
+                }
+                _ => {
+                    inst.for_each_def(|d| {
+                        nil_known.remove(&d);
+                    });
+                }
+            }
+        }
+    }
+
+    let mut changed = false;
+    let mut retained = Vec::with_capacity(block.instructions.len());
+
+    let mut pos = block.instructions.len();
+    for inst in block.instructions.drain(..).rev() {
+        pos -= 1;
+        let is_dead = if is_pure_instruction(&inst) && !nil_stores.contains(&pos) {
+            let mut has_def = false;
+            let mut all_dead = true;
+            inst.for_each_def(|dst| {
+                has_def = true;
+                if live_now.contains(&dst) || captured.contains(&dst) {
+                    all_dead = false;
+                }
+            });
+            has_def && all_dead
+        } else {
+            false
+        };
+        if is_dead {
+            changed = true;
+            continue;
+        }
+
+        // Update live_now backwards: remove defs, add uses
+        inst.for_each_def(|dst| {
+            live_now.remove(&dst);
+        });
+        inst.for_each_use(|u| {
+            live_now.insert(u);
+        });
+
+        retained.push(inst);
+    }
+
+    retained.reverse();
+    block.instructions = retained;
+    changed
+}
+
 // CFG-aware Dead Code Elimination using backward dataflow liveness analysis
 pub fn dead_code_elimination_cfg(cfg: &mut ControlFlowGraph) -> bool {
     let captured = super::captured_vars(cfg);
+
+    // Fast path: an acyclic single-block CFG converges in one backward sweep
+    // with empty live_out, without computing iterative liveness.
+    if cfg.is_single_acyclic_block() {
+        return dce_block(&mut cfg.blocks[0], new_set(), &captured);
+    }
+
     let mut any_changed = false;
     let mut changed = true;
     let mut iterations = 0;
@@ -35,73 +121,16 @@ pub fn dead_code_elimination_cfg(cfg: &mut ControlFlowGraph) -> bool {
         let liveness = LivenessInfo::compute(cfg);
 
         for block in &mut cfg.blocks {
-            // Forward pass: indices of stores with statically-nil values.
-            // Clearing a register is GC-observable (it releases whatever
-            // reference the register may still hold), so a nil-store is
-            // never dead code — even when its target is never read again
-            // (the explicit-release idiom `t = nil`). Chains like
-            // `v10 = nil; v1 = v10` propagate nil-ness forward.
-            let mut nil_known: HashSet<IrVar> = HashSet::new();
-            let mut nil_stores: HashSet<usize> = HashSet::new();
-            for (idx, inst) in block.instructions.iter().enumerate() {
-                match inst {
-                    IrInst::LoadNil { dst } => {
-                        nil_known.insert(*dst);
-                        nil_stores.insert(idx);
-                    }
-                    IrInst::Move { dst, src } => {
-                        nil_known.remove(dst);
-                        if nil_known.contains(src) {
-                            nil_known.insert(*dst);
-                            nil_stores.insert(idx);
-                        }
-                    }
-                    _ => {
-                        for d in inst.def_vars() {
-                            nil_known.remove(&d);
-                        }
-                    }
-                }
-            }
-
-            let mut live_now = liveness
+            let live_out = liveness
                 .blocks
                 .get(&block.label)
                 .map(|b| b.live_out.clone())
-                .unwrap_or_default();
+                .unwrap_or_else(new_set);
 
-            let mut retained = Vec::new();
-
-            let mut pos = block.instructions.len();
-            for inst in block.instructions.drain(..).rev() {
-                pos -= 1;
-                let defs = inst.def_vars();
-                let is_dead = is_pure_instruction(&inst)
-                    && !nil_stores.contains(&pos)
-                    && !defs.is_empty()
-                    && defs
-                        .iter()
-                        .all(|dst| !live_now.contains(dst) && !captured.contains(dst));
-                if is_dead {
-                    // Dead instruction, eliminate it
-                    changed = true;
-                    any_changed = true;
-                    continue;
-                }
-
-                // Update live_now backwards: remove def, add uses
-                for dst in defs {
-                    live_now.remove(&dst);
-                }
-                for u in inst.use_vars() {
-                    live_now.insert(u);
-                }
-
-                retained.push(inst);
+            if dce_block(block, live_out, &captured) {
+                changed = true;
+                any_changed = true;
             }
-
-            retained.reverse();
-            block.instructions = retained;
         }
     }
 
@@ -109,12 +138,12 @@ pub fn dead_code_elimination_cfg(cfg: &mut ControlFlowGraph) -> bool {
 }
 
 pub fn dead_code_elimination(module: &mut IrModule) {
-    let mut used_vars: HashSet<IrVar> = HashSet::new();
+    let mut used_vars: FxHashSet<IrVar> = new_set();
 
     for inst in &module.main.instructions {
-        for u in inst.use_vars() {
+        inst.for_each_use(|u| {
             used_vars.insert(u);
-        }
+        });
     }
 
     let mut filtered_insts = Vec::new();

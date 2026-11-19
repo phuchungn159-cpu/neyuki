@@ -11,6 +11,7 @@ use crate::ast::{Expr, InterpPart, Literal, Param, Stmt};
 use crate::compiler::ir::block::{IrFunction, IrModule, UpvalSource};
 use crate::compiler::ir::inst::{IrInst, SpreadSink, SpreadSource};
 use crate::compiler::ir::types::{IrBinaryOp, IrConstant, IrLabel, IrUnaryOp, IrVar};
+use crate::vm::hash::{FxHashMap, new_map};
 
 pub fn parse_int_from_str(s: &str) -> Option<BigInt> {
     BigInt::from_str(s).ok()
@@ -34,11 +35,11 @@ pub struct IrBuilder {
     next_var: u32,
     next_label: usize,
     instructions: Vec<IrInst>,
-    scopes: Vec<HashMap<String, IrVar>>,
+    scopes: Vec<FxHashMap<String, IrVar>>,
     loops: Vec<IrLoopContext>,
     child_protos: Vec<IrFunction>,
-    named_labels: HashMap<String, IrLabel>,
-    parent_scopes: Vec<Vec<HashMap<String, IrVar>>>,
+    named_labels: FxHashMap<String, IrLabel>,
+    parent_scopes: Vec<Vec<FxHashMap<String, IrVar>>>,
     upvalues: Vec<UpvalueDesc>,
     upvalue_vars: Vec<UpvalSource>,
     upvalue_names: Vec<String>,
@@ -60,10 +61,10 @@ impl IrBuilder {
             next_var: 0,
             next_label: 0,
             instructions: Vec::new(),
-            scopes: vec![HashMap::new()],
+            scopes: vec![new_map()],
             loops: Vec::new(),
             child_protos: Vec::new(),
-            named_labels: HashMap::new(),
+            named_labels: new_map(),
             parent_scopes: Vec::new(),
             upvalues: Vec::new(),
             upvalue_vars: Vec::new(),
@@ -94,7 +95,7 @@ impl IrBuilder {
     }
 
     pub fn enter_scope(&mut self) {
-        self.scopes.push(HashMap::new());
+        self.scopes.push(new_map());
         self.scope_vars.push(Vec::new());
     }
 

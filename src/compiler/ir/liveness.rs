@@ -1,21 +1,20 @@
 //! Backward liveness analysis over the control flow graph.
 
-use std::collections::{HashMap, HashSet};
-
 use crate::compiler::ir::block::ControlFlowGraph;
 use crate::compiler::ir::types::{IrLabel, IrVar};
+use crate::vm::hash::{FxHashMap, FxHashSet, new_set, set_with_capacity, with_capacity};
 
 #[derive(Debug, Clone)]
 pub struct BlockLiveness {
-    pub use_vars: HashSet<IrVar>,
-    pub def_vars: HashSet<IrVar>,
-    pub live_in: HashSet<IrVar>,
-    pub live_out: HashSet<IrVar>,
+    pub use_vars: FxHashSet<IrVar>,
+    pub def_vars: FxHashSet<IrVar>,
+    pub live_in: FxHashSet<IrVar>,
+    pub live_out: FxHashSet<IrVar>,
 }
 
 #[derive(Debug, Clone)]
 pub struct LivenessInfo {
-    pub blocks: HashMap<IrLabel, BlockLiveness>,
+    pub blocks: FxHashMap<IrLabel, BlockLiveness>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,22 +26,54 @@ pub struct LiveInterval {
 
 impl LivenessInfo {
     pub fn compute(cfg: &ControlFlowGraph) -> Self {
-        let mut blocks = HashMap::new();
+        let mut blocks = with_capacity(cfg.blocks.len());
 
-        // 1. Calculate local use and def sets for each basic block
-        for block in &cfg.blocks {
-            let mut block_use = HashSet::new();
-            let mut block_def = HashSet::new();
-
+        // Fast path: an acyclic single-block CFG has empty live_out and
+        // live_in == use_vars, needing no iterative dataflow or postorder walk.
+        if cfg.is_single_acyclic_block() {
+            let block = &cfg.blocks[0];
+            let mut block_use = new_set();
+            let mut block_def = new_set();
             for inst in &block.instructions {
-                for u in inst.use_vars() {
+                inst.for_each_use(|u| {
                     if !block_def.contains(&u) {
                         block_use.insert(u);
                     }
-                }
-                for d in inst.def_vars() {
+                });
+                inst.for_each_def(|d| {
                     block_def.insert(d);
-                }
+                });
+            }
+            let live_in = block_use.clone();
+            blocks.insert(
+                block.label,
+                BlockLiveness {
+                    use_vars: block_use,
+                    def_vars: block_def,
+                    live_in,
+                    live_out: new_set(),
+                },
+            );
+            return Self { blocks };
+        }
+
+        let mut label_to_idx: FxHashMap<IrLabel, usize> = with_capacity(cfg.blocks.len());
+
+        // 1. Calculate local use and def sets for each basic block
+        for (idx, block) in cfg.blocks.iter().enumerate() {
+            label_to_idx.insert(block.label, idx);
+            let mut block_use = new_set();
+            let mut block_def = new_set();
+
+            for inst in &block.instructions {
+                inst.for_each_use(|u| {
+                    if !block_def.contains(&u) {
+                        block_use.insert(u);
+                    }
+                });
+                inst.for_each_def(|d| {
+                    block_def.insert(d);
+                });
             }
 
             blocks.insert(
@@ -50,8 +81,8 @@ impl LivenessInfo {
                 BlockLiveness {
                     use_vars: block_use,
                     def_vars: block_def,
-                    live_in: HashSet::new(),
-                    live_out: HashSet::new(),
+                    live_in: new_set(),
+                    live_out: new_set(),
                 },
             );
         }
@@ -65,12 +96,7 @@ impl LivenessInfo {
         // loop nesting level costs roughly one more round. Visiting in raw
         // layout order can propagate only one block per round and hit the
         // iteration cap on loop-heavy functions.
-        let succ_map: HashMap<IrLabel, Vec<IrLabel>> = cfg
-            .blocks
-            .iter()
-            .map(|block| (block.label, block.successors.clone()))
-            .collect();
-        let order = Self::reverse_postorder(cfg);
+        let order = Self::reverse_postorder(cfg, &label_to_idx);
         let mut changed = true;
         let mut iterations = 0;
         const MAX_ITERATIONS: usize = 1000;
@@ -81,9 +107,9 @@ impl LivenessInfo {
 
             for lbl in &order {
                 // Compute out[B]
-                let mut new_out = HashSet::new();
-                if let Some(successors) = succ_map.get(lbl) {
-                    for succ in successors {
+                let mut new_out = new_set();
+                if let Some(&idx) = label_to_idx.get(lbl) {
+                    for succ in &cfg.blocks[idx].successors {
                         if let Some(succ_info) = blocks.get(succ) {
                             new_out.extend(succ_info.live_in.iter().copied());
                         }
@@ -93,7 +119,7 @@ impl LivenessInfo {
                 // Compute in[B] = use[B] Union (out[B] \ def[B]), borrowing
                 // the stored sets instead of cloning them every round.
                 let b = &blocks[lbl];
-                let mut new_in = HashSet::with_capacity(b.use_vars.len() + new_out.len());
+                let mut new_in = set_with_capacity(b.use_vars.len() + new_out.len());
                 new_in.extend(b.use_vars.iter().copied());
                 for v in &new_out {
                     if !b.def_vars.contains(v) {
@@ -118,12 +144,16 @@ impl LivenessInfo {
     /// backward analysis that visits blocks in this order propagates straight
     /// chains in one round and each loop level in one more, instead of one
     /// block per round.
-    fn reverse_postorder(cfg: &ControlFlowGraph) -> Vec<IrLabel> {
-        let mut visited: HashSet<IrLabel> = HashSet::new();
-        let mut post: Vec<IrLabel> = Vec::new();
+    fn reverse_postorder(
+        cfg: &ControlFlowGraph,
+        label_to_idx: &FxHashMap<IrLabel, usize>,
+    ) -> Vec<IrLabel> {
+        let mut visited: FxHashSet<IrLabel> = set_with_capacity(cfg.blocks.len());
+        let mut post: Vec<IrLabel> = Vec::with_capacity(cfg.blocks.len());
         // Seed with the entry plus every block, so unreachable blocks are covered
         // while the entry's reachable region still comes first.
-        let mut seeds: Vec<IrLabel> = vec![cfg.entry_label];
+        let mut seeds: Vec<IrLabel> = Vec::with_capacity(cfg.blocks.len() + 1);
+        seeds.push(cfg.entry_label);
         for block in &cfg.blocks {
             seeds.push(block.label);
         }
@@ -141,8 +171,8 @@ impl LivenessInfo {
                     continue;
                 }
                 stack.push((lbl, true));
-                if let Some(block) = cfg.find_block(lbl) {
-                    for succ in &block.successors {
+                if let Some(&idx) = label_to_idx.get(&lbl) {
+                    for succ in &cfg.blocks[idx].successors {
                         if !visited.contains(succ) {
                             stack.push((*succ, false));
                         }
@@ -165,8 +195,8 @@ impl LivenessInfo {
             .is_some_and(|b| b.live_out.contains(&var))
     }
 
-    pub fn compute_live_intervals(&self, cfg: &ControlFlowGraph) -> HashMap<IrVar, LiveInterval> {
-        let mut intervals: HashMap<IrVar, (usize, usize)> = HashMap::new();
+    pub fn compute_live_intervals(&self, cfg: &ControlFlowGraph) -> FxHashMap<IrVar, LiveInterval> {
+        let mut intervals: FxHashMap<IrVar, (usize, usize)> = with_capacity(32);
         let mut pc = 0usize;
 
         for block in &cfg.blocks {
@@ -181,19 +211,19 @@ impl LivenessInfo {
             }
 
             for inst in &block.instructions {
-                for u in inst.use_vars() {
+                inst.for_each_use(|u| {
                     intervals
                         .entry(u)
                         .and_modify(|(_, end)| *end = (*end).max(pc))
                         .or_insert((pc, pc));
-                }
+                });
 
-                for d in inst.def_vars() {
+                inst.for_each_def(|d| {
                     intervals
                         .entry(d)
                         .and_modify(|(_, end)| *end = (*end).max(pc))
                         .or_insert((pc, pc));
-                }
+                });
 
                 pc += 1;
             }

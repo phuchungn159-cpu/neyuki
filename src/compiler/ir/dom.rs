@@ -1,22 +1,22 @@
 //! Dominator trees and dominance frontiers.
 
-use std::collections::{HashMap, HashSet};
-
 use crate::compiler::ir::block::ControlFlowGraph;
 use crate::compiler::ir::types::IrLabel;
+use crate::vm::hash::{FxHashMap, FxHashSet, new_map, with_capacity};
 
+/// Immediate dominators without tree children or dominance frontiers.
+/// Passes that only query dominance (e.g. LICM) build this lighter type so a
+/// `DominatorTree` is never left half-populated.
 #[derive(Debug, Clone)]
-pub struct DominatorTree {
-    pub idom: HashMap<IrLabel, IrLabel>,
-    pub children: HashMap<IrLabel, Vec<IrLabel>>,
-    pub frontiers: HashMap<IrLabel, HashSet<IrLabel>>,
+pub struct ImmediateDominators {
+    pub idom: FxHashMap<IrLabel, IrLabel>,
 }
 
-impl DominatorTree {
+impl ImmediateDominators {
     pub fn build(cfg: &ControlFlowGraph) -> Self {
         let entry = cfg.entry_label;
-        let mut idom: HashMap<IrLabel, IrLabel> = HashMap::new();
-        let mut label_to_idx: HashMap<IrLabel, usize> = HashMap::new();
+        let mut idom: FxHashMap<IrLabel, IrLabel> = with_capacity(cfg.blocks.len());
+        let mut label_to_idx: FxHashMap<IrLabel, usize> = with_capacity(cfg.blocks.len());
 
         for (idx, b) in cfg.blocks.iter().enumerate() {
             label_to_idx.insert(b.label, idx);
@@ -65,8 +65,48 @@ impl DominatorTree {
             }
         }
 
+        Self { idom }
+    }
+
+    pub fn dominates(&self, a: IrLabel, b: IrLabel) -> bool {
+        idom_dominates(&self.idom, a, b)
+    }
+}
+
+fn idom_dominates(idom: &FxHashMap<IrLabel, IrLabel>, a: IrLabel, mut b: IrLabel) -> bool {
+    if a == b {
+        return true;
+    }
+    let mut steps = 0;
+    while let Some(&parent) = idom.get(&b) {
+        if parent == a {
+            return true;
+        }
+        if parent == b {
+            break;
+        }
+        b = parent;
+        steps += 1;
+        if steps > 1000 {
+            break;
+        }
+    }
+    false
+}
+
+#[derive(Debug, Clone)]
+pub struct DominatorTree {
+    pub idom: FxHashMap<IrLabel, IrLabel>,
+    pub children: FxHashMap<IrLabel, Vec<IrLabel>>,
+    pub frontiers: FxHashMap<IrLabel, FxHashSet<IrLabel>>,
+}
+
+impl DominatorTree {
+    pub fn build(cfg: &ControlFlowGraph) -> Self {
+        let idom = ImmediateDominators::build(cfg).idom;
+
         // Build tree children
-        let mut children: HashMap<IrLabel, Vec<IrLabel>> = HashMap::new();
+        let mut children: FxHashMap<IrLabel, Vec<IrLabel>> = new_map();
         for (&node, &parent) in &idom {
             if node != parent {
                 children.entry(parent).or_default().push(node);
@@ -74,7 +114,7 @@ impl DominatorTree {
         }
 
         // Build dominance frontiers
-        let mut frontiers: HashMap<IrLabel, HashSet<IrLabel>> = HashMap::new();
+        let mut frontiers: FxHashMap<IrLabel, FxHashSet<IrLabel>> = with_capacity(cfg.blocks.len());
         for b in &cfg.blocks {
             frontiers.entry(b.label).or_default();
         }
@@ -110,33 +150,16 @@ impl DominatorTree {
         }
     }
 
-    pub fn dominates(&self, a: IrLabel, mut b: IrLabel) -> bool {
-        if a == b {
-            return true;
-        }
-        let mut steps = 0;
-        while let Some(&parent) = self.idom.get(&b) {
-            if parent == a {
-                return true;
-            }
-            if parent == b {
-                break;
-            }
-            b = parent;
-            steps += 1;
-            if steps > 1000 {
-                break;
-            }
-        }
-        false
+    pub fn dominates(&self, a: IrLabel, b: IrLabel) -> bool {
+        idom_dominates(&self.idom, a, b)
     }
 }
 
 fn intersect(
     mut b1: IrLabel,
     mut b2: IrLabel,
-    idom: &HashMap<IrLabel, IrLabel>,
-    label_to_idx: &HashMap<IrLabel, usize>,
+    idom: &FxHashMap<IrLabel, IrLabel>,
+    label_to_idx: &FxHashMap<IrLabel, usize>,
 ) -> IrLabel {
     let mut steps = 0;
     while b1 != b2 && steps < 1000 {
