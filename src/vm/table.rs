@@ -216,9 +216,14 @@ pub fn next_entry(table: &VmTable, key: &Value) -> Result<Option<(Value, Value)>
 
 /// A fast string-keyed map for a table's named fields (`obj.id`, `obj[k]`).
 ///
-/// Implemented as an open-addressing hash table with power-of-two capacity and
-/// Knuth backward-shift deletion (zero tombstones). Keys store their precomputed
-/// 64-bit hash, eliminating re-hashing across all lookups, mutations, and table growths.
+/// Small tables (`<= SMALL_FIELD_LIMIT` fields) store entries inline in a
+/// compact `Vec<FieldEntry>`, avoiding power-of-two slack and `None`-slot
+/// zeroing on small object literals while scanning within a single cache line.
+/// Larger tables promote automatically to an open-addressing power-of-two hash
+/// table with Knuth backward-shift deletion (zero tombstones). Keys store their
+/// precomputed 64-bit hash, eliminating re-hashing across lookups and growth.
+const SMALL_FIELD_LIMIT: usize = 8;
+
 #[derive(Clone, Debug)]
 pub struct FieldEntry {
     pub hash: u64,
@@ -226,132 +231,178 @@ pub struct FieldEntry {
     pub val: Value,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct FieldMap {
+#[derive(Clone, Debug)]
+struct HashFieldMap {
     entries: Vec<Option<FieldEntry>>,
     count: usize,
 }
 
-impl FieldMap {
-    #[inline]
-    pub fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-            count: 0,
-        }
+#[inline(always)]
+pub(crate) fn assign_value(slot: &mut Value, val: &Value) {
+    match (val, slot) {
+        (Value::Int(n), Value::Int(o)) => *o = *n,
+        (Value::Float(n), Value::Float(o)) => *o = *n,
+        (Value::Bool(n), Value::Bool(o)) => *o = *n,
+        (v, dst) => *dst = v.clone(),
+    }
+}
+
+#[inline(always)]
+fn entry_matches_strref(entry: &FieldEntry, hash: u64, key: &StrRef) -> bool {
+    entry.hash == hash && (Rc::ptr_eq(&entry.key.0, &key.0) || entry.key.0.str == key.0.str)
+}
+
+impl HashFieldMap {
+    fn with_capacity(cap: usize) -> Self {
+        let n = (cap * 4 / 3 + 1).next_power_of_two().max(4);
+        let mut entries = Vec::with_capacity(n);
+        entries.resize_with(n, || None);
+        Self { entries, count: 0 }
     }
 
-    #[inline]
-    pub fn with_capacity(cap: usize) -> Self {
-        if cap == 0 {
-            Self::new()
-        } else {
-            let n = (cap * 4 / 3 + 1).next_power_of_two().max(4);
-            let mut entries = Vec::with_capacity(n);
-            entries.resize_with(n, || None);
-            Self { entries, count: 0 }
+    fn from_small(small: Vec<FieldEntry>) -> Self {
+        let cap = (small.len() * 2).next_power_of_two().max(16);
+        let mut entries = Vec::with_capacity(cap);
+        entries.resize_with(cap, || None);
+        let mask = cap - 1;
+        let count = small.len();
+        for entry in small {
+            let mut idx = (entry.hash as usize) & mask;
+            while entries[idx].is_some() {
+                idx = (idx + 1) & mask;
+            }
+            entries[idx] = Some(entry);
         }
+        Self { entries, count }
     }
 
+    /// Probes the open-addressed table for an entry matching `matches`,
+    /// returning `Ok(index)` on hit or `Err(empty_index)` on miss.
+    /// Caller must ensure `!self.entries.is_empty()` and `self.count < self.entries.len()`.
     #[inline(always)]
-    pub fn len(&self) -> usize {
-        self.count
-    }
-
-    #[inline(always)]
-    pub fn is_empty(&self) -> bool {
-        self.count == 0
-    }
-
-    #[inline]
-    pub fn find_index_by_strref(&self, key: &StrRef) -> Option<usize> {
-        if self.count == 0 {
-            return None;
-        }
+    fn find_slot(
+        &self,
+        hash: u64,
+        mut matches: impl FnMut(&FieldEntry) -> bool,
+    ) -> Result<usize, usize> {
         let mask = self.entries.len() - 1;
-        let hash = key.0.hash;
         let mut idx = (hash as usize) & mask;
         loop {
-            let entry = self.entries[idx].as_ref()?;
-            if entry.hash == hash
-                && (Rc::ptr_eq(&entry.key.0, &key.0) || entry.key.0.str == key.0.str)
-            {
-                return Some(idx);
+            match &self.entries[idx] {
+                None => return Err(idx),
+                Some(entry) if matches(entry) => return Ok(idx),
+                _ => idx = (idx + 1) & mask,
             }
-            idx = (idx + 1) & mask;
         }
     }
 
     #[inline]
-    pub fn find_index(&self, key: &str) -> Option<usize> {
+    fn get_by_strref(&self, key: &StrRef) -> Option<&Value> {
         if self.count == 0 {
             return None;
         }
-        let mask = self.entries.len() - 1;
+        let hash = key.0.hash;
+        let idx = self
+            .find_slot(hash, |e| entry_matches_strref(e, hash, key))
+            .ok()?;
+        self.entries[idx].as_ref().map(|e| &e.val)
+    }
+
+    #[inline]
+    fn get_mut_by_strref(&mut self, key: &StrRef) -> Option<&mut Value> {
+        if self.count == 0 {
+            return None;
+        }
+        let hash = key.0.hash;
+        let idx = self
+            .find_slot(hash, |e| entry_matches_strref(e, hash, key))
+            .ok()?;
+        self.entries[idx].as_mut().map(|e| &mut e.val)
+    }
+
+    #[inline]
+    fn get(&self, key: &str) -> Option<&Value> {
+        if self.count == 0 {
+            return None;
+        }
         let hash = crate::vm::hash::fx_hash_bytes(key.as_bytes());
-        let mut idx = (hash as usize) & mask;
-        loop {
-            let entry = self.entries[idx].as_ref()?;
-            if entry.hash == hash && entry.key.0.str == key {
-                return Some(idx);
-            }
-            idx = (idx + 1) & mask;
+        let idx = self
+            .find_slot(hash, |e| e.hash == hash && e.key.0.str == key)
+            .ok()?;
+        self.entries[idx].as_ref().map(|e| &e.val)
+    }
+
+    #[inline]
+    fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
+        if self.count == 0 {
+            return None;
         }
+        let hash = crate::vm::hash::fx_hash_bytes(key.as_bytes());
+        let idx = self
+            .find_slot(hash, |e| e.hash == hash && e.key.0.str == key)
+            .ok()?;
+        self.entries[idx].as_mut().map(|e| &mut e.val)
     }
 
-    #[inline]
-    pub fn get_by_strref(&self, key: &StrRef) -> Option<&Value> {
-        let idx = self.find_index_by_strref(key)?;
-        self.entries[idx].as_ref().map(|entry| &entry.val)
-    }
-
-    #[inline]
-    pub fn get_mut_by_strref(&mut self, key: &StrRef) -> Option<&mut Value> {
-        let idx = self.find_index_by_strref(key)?;
-        self.entries[idx].as_mut().map(|entry| &mut entry.val)
-    }
-
-    #[inline]
-    pub fn get(&self, key: &str) -> Option<&Value> {
-        let idx = self.find_index(key)?;
-        self.entries[idx].as_ref().map(|entry| &entry.val)
-    }
-
-    #[inline]
-    pub fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
-        let idx = self.find_index(key)?;
-        self.entries[idx].as_mut().map(|entry| &mut entry.val)
-    }
-
-    #[inline]
-    pub fn contains_key(&self, key: &str) -> bool {
-        self.get(key).is_some()
-    }
-
-    pub fn insert(&mut self, key: StrRef, val: Value) -> Option<Value> {
-        if self.entries.is_empty() || (self.count + 1) * 4 > self.entries.len() * 3 {
-            self.grow();
-        }
-        let mask = self.entries.len() - 1;
+    fn insert(&mut self, key: StrRef, val: Value) -> Option<Value> {
         let hash = key.0.hash;
-        let mut idx = (hash as usize) & mask;
-        loop {
-            match &mut self.entries[idx] {
-                None => {
+        if !self.entries.is_empty() {
+            match self.find_slot(hash, |e| entry_matches_strref(e, hash, &key)) {
+                Ok(idx) => {
+                    return self.entries[idx]
+                        .as_mut()
+                        .map(|e| std::mem::replace(&mut e.val, val));
+                }
+                Err(idx) if (self.count + 1) * 4 <= self.entries.len() * 3 => {
                     self.entries[idx] = Some(FieldEntry { hash, key, val });
                     self.count += 1;
                     return None;
                 }
-                Some(entry) => {
-                    if entry.hash == hash
-                        && (Rc::ptr_eq(&entry.key.0, &key.0) || entry.key.0.str == key.0.str)
-                    {
-                        return Some(std::mem::replace(&mut entry.val, val));
-                    }
-                    idx = (idx + 1) & mask;
-                }
+                Err(_) => {}
             }
         }
+        self.grow();
+        let Err(idx) = self.find_slot(hash, |e| entry_matches_strref(e, hash, &key)) else {
+            unreachable!("missing key cannot exist after grow");
+        };
+        self.entries[idx] = Some(FieldEntry { hash, key, val });
+        self.count += 1;
+        None
+    }
+
+    #[inline]
+    fn set_by_strref(&mut self, key: &StrRef, val: &Value) {
+        let hash = key.0.hash;
+        if !self.entries.is_empty() {
+            match self.find_slot(hash, |e| entry_matches_strref(e, hash, key)) {
+                Ok(idx) => {
+                    if let Some(entry) = &mut self.entries[idx] {
+                        assign_value(&mut entry.val, val);
+                    }
+                    return;
+                }
+                Err(idx) if (self.count + 1) * 4 <= self.entries.len() * 3 => {
+                    self.entries[idx] = Some(FieldEntry {
+                        hash,
+                        key: key.clone(),
+                        val: val.clone(),
+                    });
+                    self.count += 1;
+                    return;
+                }
+                Err(_) => {}
+            }
+        }
+        self.grow();
+        let Err(idx) = self.find_slot(hash, |e| entry_matches_strref(e, hash, key)) else {
+            unreachable!("missing key cannot exist after grow");
+        };
+        self.entries[idx] = Some(FieldEntry {
+            hash,
+            key: key.clone(),
+            val: val.clone(),
+        });
+        self.count += 1;
     }
 
     fn grow(&mut self) {
@@ -369,107 +420,48 @@ impl FieldMap {
         self.entries = new_entries;
     }
 
-    pub fn remove(&mut self, key: &str) -> Option<Value> {
+    fn remove_at(&mut self, found: usize) -> Option<Value> {
+        let mask = self.entries.len() - 1;
+        let removed = self.entries[found].take().map(|e| e.val);
+        self.count -= 1;
+        let mut i = found;
+        let mut j = (found + 1) & mask;
+        while let Some(entry) = &self.entries[j] {
+            let nat = (entry.hash as usize) & mask;
+            let dist_to_nat = (j + mask + 1 - nat) & mask;
+            let dist_to_i = (j + mask + 1 - i) & mask;
+            if dist_to_i <= dist_to_nat {
+                self.entries[i] = self.entries[j].take();
+                i = j;
+            }
+            j = (j + 1) & mask;
+        }
+        removed
+    }
+
+    fn remove(&mut self, key: &str) -> Option<Value> {
         if self.count == 0 {
             return None;
         }
-        let mask = self.entries.len() - 1;
         let hash = crate::vm::hash::fx_hash_bytes(key.as_bytes());
-        let mut idx = (hash as usize) & mask;
-        let found = loop {
-            match &self.entries[idx] {
-                None => return None,
-                Some(entry) if entry.hash == hash && entry.key.0.str == key => {
-                    break idx;
-                }
-                _ => {
-                    idx = (idx + 1) & mask;
-                }
-            }
-        };
-        let removed = self.entries[found].take().map(|e| e.val);
-        self.count -= 1;
-        let mut i = found;
-        let mut j = (found + 1) & mask;
-        while let Some(entry) = &self.entries[j] {
-            let nat = (entry.hash as usize) & mask;
-            let dist_to_nat = (j + mask + 1 - nat) & mask;
-            let dist_to_i = (j + mask + 1 - i) & mask;
-            if dist_to_i <= dist_to_nat {
-                self.entries[i] = self.entries[j].take();
-                i = j;
-            }
-            j = (j + 1) & mask;
-        }
-        removed
+        let found = self
+            .find_slot(hash, |e| e.hash == hash && e.key.0.str == key)
+            .ok()?;
+        self.remove_at(found)
     }
 
-    pub fn remove_by_strref(&mut self, key: &StrRef) -> Option<Value> {
+    fn remove_by_strref(&mut self, key: &StrRef) -> Option<Value> {
         if self.count == 0 {
             return None;
         }
-        let mask = self.entries.len() - 1;
         let hash = key.0.hash;
-        let mut idx = (hash as usize) & mask;
-        let found = loop {
-            match &self.entries[idx] {
-                None => return None,
-                Some(entry)
-                    if entry.hash == hash
-                        && (Rc::ptr_eq(&entry.key.0, &key.0) || entry.key.0.str == key.0.str) =>
-                {
-                    break idx;
-                }
-                _ => {
-                    idx = (idx + 1) & mask;
-                }
-            }
-        };
-        let removed = self.entries[found].take().map(|e| e.val);
-        self.count -= 1;
-        let mut i = found;
-        let mut j = (found + 1) & mask;
-        while let Some(entry) = &self.entries[j] {
-            let nat = (entry.hash as usize) & mask;
-            let dist_to_nat = (j + mask + 1 - nat) & mask;
-            let dist_to_i = (j + mask + 1 - i) & mask;
-            if dist_to_i <= dist_to_nat {
-                self.entries[i] = self.entries[j].take();
-                i = j;
-            }
-            j = (j + 1) & mask;
-        }
-        removed
+        let found = self
+            .find_slot(hash, |e| entry_matches_strref(e, hash, key))
+            .ok()?;
+        self.remove_at(found)
     }
 
-    #[inline]
-    pub fn clear(&mut self) {
-        self.entries.clear();
-        self.count = 0;
-    }
-
-    #[inline]
-    pub fn iter(&self) -> impl Iterator<Item = (&StrRef, &Value)> {
-        self.entries
-            .iter()
-            .filter_map(|opt| opt.as_ref().map(|e| (&e.key, &e.val)))
-    }
-
-    #[inline]
-    pub fn values(&self) -> impl Iterator<Item = &Value> {
-        self.entries
-            .iter()
-            .filter_map(|opt| opt.as_ref().map(|e| &e.val))
-    }
-
-    #[inline]
-    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut Value> {
-        self.entries
-            .iter_mut()
-            .filter_map(|opt| opt.as_mut().map(|e| &mut e.val))
-    }
-
-    pub fn retain<F>(&mut self, mut f: F)
+    fn retain<F>(&mut self, mut f: F)
     where
         F: FnMut(&StrRef, &mut Value) -> bool,
     {
@@ -491,6 +483,299 @@ impl FieldMap {
                 self.entries[idx] = Some(entry);
                 self.count += 1;
             }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum FieldStorage {
+    Small(Vec<FieldEntry>),
+    Hash(Box<HashFieldMap>),
+}
+
+#[derive(Clone, Debug)]
+pub struct FieldMap {
+    inner: FieldStorage,
+}
+
+impl Default for FieldMap {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+enum FieldEntryIter<'a> {
+    Small(std::slice::Iter<'a, FieldEntry>),
+    Hash(std::slice::Iter<'a, Option<FieldEntry>>),
+}
+
+impl<'a> Iterator for FieldEntryIter<'a> {
+    type Item = &'a FieldEntry;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Small(it) => it.next(),
+            Self::Hash(it) => it.find_map(|opt| opt.as_ref()),
+        }
+    }
+}
+
+enum FieldEntryIterMut<'a> {
+    Small(std::slice::IterMut<'a, FieldEntry>),
+    Hash(std::slice::IterMut<'a, Option<FieldEntry>>),
+}
+
+impl<'a> Iterator for FieldEntryIterMut<'a> {
+    type Item = &'a mut FieldEntry;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Small(it) => it.next(),
+            Self::Hash(it) => it.find_map(|opt| opt.as_mut()),
+        }
+    }
+}
+
+impl FieldMap {
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            inner: FieldStorage::Small(Vec::new()),
+        }
+    }
+
+    #[inline]
+    pub fn with_capacity(cap: usize) -> Self {
+        let inner = if cap == 0 {
+            FieldStorage::Small(Vec::new())
+        } else if cap <= SMALL_FIELD_LIMIT {
+            FieldStorage::Small(Vec::with_capacity(cap))
+        } else {
+            FieldStorage::Hash(Box::new(HashFieldMap::with_capacity(cap)))
+        };
+        Self { inner }
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        match &self.inner {
+            FieldStorage::Small(entries) => entries.len(),
+            FieldStorage::Hash(map) => map.count,
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub fn get_by_strref(&self, key: &StrRef) -> Option<&Value> {
+        match &self.inner {
+            FieldStorage::Small(entries) => {
+                let hash = key.0.hash;
+                for entry in entries {
+                    if entry_matches_strref(entry, hash, key) {
+                        return Some(&entry.val);
+                    }
+                }
+                None
+            }
+            FieldStorage::Hash(map) => map.get_by_strref(key),
+        }
+    }
+
+    #[inline]
+    pub fn get_mut_by_strref(&mut self, key: &StrRef) -> Option<&mut Value> {
+        match &mut self.inner {
+            FieldStorage::Small(entries) => {
+                let hash = key.0.hash;
+                for entry in entries {
+                    if entry_matches_strref(entry, hash, key) {
+                        return Some(&mut entry.val);
+                    }
+                }
+                None
+            }
+            FieldStorage::Hash(map) => map.get_mut_by_strref(key),
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        match &self.inner {
+            FieldStorage::Small(entries) => {
+                if entries.is_empty() {
+                    return None;
+                }
+                let hash = crate::vm::hash::fx_hash_bytes(key.as_bytes());
+                for entry in entries {
+                    if entry.hash == hash && entry.key.0.str == key {
+                        return Some(&entry.val);
+                    }
+                }
+                None
+            }
+            FieldStorage::Hash(map) => map.get(key),
+        }
+    }
+
+    #[inline]
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
+        match &mut self.inner {
+            FieldStorage::Small(entries) => {
+                if entries.is_empty() {
+                    return None;
+                }
+                let hash = crate::vm::hash::fx_hash_bytes(key.as_bytes());
+                for entry in entries {
+                    if entry.hash == hash && entry.key.0.str == key {
+                        return Some(&mut entry.val);
+                    }
+                }
+                None
+            }
+            FieldStorage::Hash(map) => map.get_mut(key),
+        }
+    }
+
+    #[inline]
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.get(key).is_some()
+    }
+
+    /// Promotes small linear storage to a boxed open-addressed hash map.
+    fn promote_to_hash(&mut self) -> &mut HashFieldMap {
+        if let FieldStorage::Small(entries) = &mut self.inner {
+            let small = std::mem::take(entries);
+            self.inner = FieldStorage::Hash(Box::new(HashFieldMap::from_small(small)));
+        }
+        match &mut self.inner {
+            FieldStorage::Hash(map) => map,
+            FieldStorage::Small(_) => unreachable!("just promoted to Hash"),
+        }
+    }
+
+    pub fn insert(&mut self, key: StrRef, val: Value) -> Option<Value> {
+        match &mut self.inner {
+            FieldStorage::Small(entries) => {
+                let hash = key.0.hash;
+                for entry in entries.iter_mut() {
+                    if entry_matches_strref(entry, hash, &key) {
+                        return Some(std::mem::replace(&mut entry.val, val));
+                    }
+                }
+                if entries.len() < SMALL_FIELD_LIMIT {
+                    entries.push(FieldEntry { hash, key, val });
+                    return None;
+                }
+                self.promote_to_hash().insert(key, val)
+            }
+            FieldStorage::Hash(map) => map.insert(key, val),
+        }
+    }
+
+    /// Single-probe update-or-insert for VM `SetTable` / `SetTableK` fast paths.
+    /// Updates primitive values in place on hit and only clones `key` on miss.
+    #[inline]
+    pub fn set_by_strref(&mut self, key: &StrRef, val: &Value) {
+        match &mut self.inner {
+            FieldStorage::Small(entries) => {
+                let hash = key.0.hash;
+                for entry in entries.iter_mut() {
+                    if entry_matches_strref(entry, hash, key) {
+                        assign_value(&mut entry.val, val);
+                        return;
+                    }
+                }
+                if entries.len() < SMALL_FIELD_LIMIT {
+                    entries.push(FieldEntry {
+                        hash,
+                        key: key.clone(),
+                        val: val.clone(),
+                    });
+                    return;
+                }
+                self.promote_to_hash().set_by_strref(key, val);
+            }
+            FieldStorage::Hash(map) => map.set_by_strref(key, val),
+        }
+    }
+
+    pub fn remove(&mut self, key: &str) -> Option<Value> {
+        match &mut self.inner {
+            FieldStorage::Small(entries) => {
+                if entries.is_empty() {
+                    return None;
+                }
+                let hash = crate::vm::hash::fx_hash_bytes(key.as_bytes());
+                let pos = entries
+                    .iter()
+                    .position(|e| e.hash == hash && e.key.0.str == key)?;
+                Some(entries.swap_remove(pos).val)
+            }
+            FieldStorage::Hash(map) => map.remove(key),
+        }
+    }
+
+    pub fn remove_by_strref(&mut self, key: &StrRef) -> Option<Value> {
+        match &mut self.inner {
+            FieldStorage::Small(entries) => {
+                let hash = key.0.hash;
+                let pos = entries
+                    .iter()
+                    .position(|e| entry_matches_strref(e, hash, key))?;
+                Some(entries.swap_remove(pos).val)
+            }
+            FieldStorage::Hash(map) => map.remove_by_strref(key),
+        }
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        match &mut self.inner {
+            FieldStorage::Small(entries) => entries.clear(),
+            FieldStorage::Hash(_) => self.inner = FieldStorage::Small(Vec::new()),
+        }
+    }
+
+    #[inline]
+    fn entry_iter(&self) -> FieldEntryIter<'_> {
+        match &self.inner {
+            FieldStorage::Small(entries) => FieldEntryIter::Small(entries.iter()),
+            FieldStorage::Hash(map) => FieldEntryIter::Hash(map.entries.iter()),
+        }
+    }
+
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = (&StrRef, &Value)> {
+        self.entry_iter().map(|e| (&e.key, &e.val))
+    }
+
+    #[inline]
+    pub fn values(&self) -> impl Iterator<Item = &Value> {
+        self.entry_iter().map(|e| &e.val)
+    }
+
+    #[inline]
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut Value> {
+        let iter = match &mut self.inner {
+            FieldStorage::Small(entries) => FieldEntryIterMut::Small(entries.iter_mut()),
+            FieldStorage::Hash(map) => FieldEntryIterMut::Hash(map.entries.iter_mut()),
+        };
+        iter.map(|e| &mut e.val)
+    }
+
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&StrRef, &mut Value) -> bool,
+    {
+        match &mut self.inner {
+            FieldStorage::Small(entries) => entries.retain_mut(|e| f(&e.key, &mut e.val)),
+            FieldStorage::Hash(map) => map.retain(f),
         }
     }
 }
@@ -562,5 +847,91 @@ mod tests {
         map.clear();
         assert!(map.is_empty());
         assert_eq!(map.len(), 0);
+    }
+
+    #[test]
+    fn test_field_map_small_to_hash_promotion_and_set_by_strref() {
+        assert!(std::mem::size_of::<FieldMap>() <= 32);
+
+        let mut map = FieldMap::with_capacity(3);
+        assert!(matches!(map.inner, FieldStorage::Small(_)));
+
+        // Fill up to the small limit (8 entries) via set_by_strref.
+        for i in 0..SMALL_FIELD_LIMIT {
+            let k = StrRef::from(format!("k{i}"));
+            map.set_by_strref(&k, &Value::Int(i as i64));
+        }
+        assert!(matches!(map.inner, FieldStorage::Small(_)));
+        assert_eq!(map.len(), SMALL_FIELD_LIMIT);
+
+        // In-place primitive overwrite in Small mode keeps Small representation.
+        let k2 = StrRef::from("k2");
+        map.set_by_strref(&k2, &Value::Int(200));
+        assert!(matches!(map.inner, FieldStorage::Small(_)));
+        assert_eq!(map.get("k2"), Some(&Value::Int(200)));
+
+        // Remove and re-insert in Small mode.
+        assert_eq!(map.remove_by_strref(&k2), Some(Value::Int(200)));
+        assert_eq!(map.len(), SMALL_FIELD_LIMIT - 1);
+        map.set_by_strref(&k2, &Value::Int(202));
+        assert!(matches!(map.inner, FieldStorage::Small(_)));
+
+        // 9th distinct key promotes seamlessly to Hash mode.
+        let k8 = StrRef::from("k8");
+        map.set_by_strref(&k8, &Value::Int(800));
+        assert!(matches!(map.inner, FieldStorage::Hash(_)));
+        assert_eq!(map.len(), SMALL_FIELD_LIMIT + 1);
+        assert_eq!(map.get_by_strref(&k8), Some(&Value::Int(800)));
+        assert_eq!(map.get("k2"), Some(&Value::Int(202)));
+        for i in 0..SMALL_FIELD_LIMIT {
+            let expected = if i == 2 { 202 } else { i as i64 };
+            assert_eq!(map.get(&format!("k{i}")), Some(&Value::Int(expected)));
+        }
+
+        // Overwrite in Hash mode via set_by_strref.
+        map.set_by_strref(&k8, &Value::Float(8.5));
+        assert_eq!(map.get("k8"), Some(&Value::Float(8.5)));
+
+        // Retain in both Small and Hash modes.
+        map.retain(|k, _| &**k == "k8" || &**k == "k2");
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("k2"), Some(&Value::Int(202)));
+        assert_eq!(map.get("k8"), Some(&Value::Float(8.5)));
+
+        let mut small = FieldMap::with_capacity(4);
+        small.insert(StrRef::from("a"), Value::Int(1));
+        small.insert(StrRef::from("b"), Value::Int(2));
+        small.retain(|k, _| &**k == "b");
+        assert!(matches!(small.inner, FieldStorage::Small(_)));
+        assert_eq!(small.len(), 1);
+        assert_eq!(small.get("b"), Some(&Value::Int(2)));
+        assert_eq!(small.get("a"), None);
+    }
+
+    #[test]
+    fn test_field_map_update_at_load_threshold_does_not_rehash() {
+        // 12 keys in a 16-slot hash map sits right at the 75% load limit
+        // (`(12 + 1) * 4 > 16 * 3`). Updating existing keys must not rehash.
+        let mut map = FieldMap::new();
+        for i in 0..12 {
+            map.insert(StrRef::from(format!("k{i}")), Value::Int(i));
+        }
+        let cap_before = match &map.inner {
+            FieldStorage::Hash(h) => h.entries.len(),
+            FieldStorage::Small(_) => panic!("expected Hash storage"),
+        };
+        assert_eq!(cap_before, 16);
+
+        let k0 = StrRef::from("k0");
+        map.set_by_strref(&k0, &Value::Int(999));
+        map.insert(StrRef::from("k1"), Value::Int(888));
+
+        let cap_after = match &map.inner {
+            FieldStorage::Hash(h) => h.entries.len(),
+            FieldStorage::Small(_) => panic!("expected Hash storage"),
+        };
+        assert_eq!(cap_after, cap_before);
+        assert_eq!(map.get("k0"), Some(&Value::Int(999)));
+        assert_eq!(map.get("k1"), Some(&Value::Int(888)));
     }
 }
