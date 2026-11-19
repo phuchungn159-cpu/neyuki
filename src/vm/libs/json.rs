@@ -50,7 +50,7 @@ fn null_sentinel() -> Value {
     NULL.with(|n| Value::Table(n.clone()))
 }
 
-fn is_null(value: &Value) -> bool {
+pub(crate) fn is_null(value: &Value) -> bool {
     matches!(value, Value::Table(t) if NULL.with(|n| Rc::ptr_eq(n, t)))
 }
 

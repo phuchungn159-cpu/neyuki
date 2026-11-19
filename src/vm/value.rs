@@ -162,6 +162,7 @@ pub enum Value {
     Buffer(Rc<RefCell<VmBuffer>>),
 }
 
+#[derive(Clone)]
 pub struct VmTable {
     pub array: Vec<Value>,
     pub fields: crate::vm::table::FieldMap,

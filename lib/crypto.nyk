@@ -11,24 +11,20 @@ local crypto = {}
 
 const ENCODINGS = { hex = true, base64 = true, base64url = true }
 
-function checkString(s: string, name: string)
+local function checkString(s: string, name: string)
     if (s == nil) then error(name .. " must be provided") end
     if (type(s) != "string") then error(name .. " must be a string") end
 end
 
-function checkOptionalString(s: string?, name: string)
+local function checkOptionalString(s: string?, name: string)
     if (s != nil) then checkString(s, name) end
 end
 
-function checkOptionalNumber(n: number?, name: string)
-    if (n != nil and type(n) != "number") then error(name .. " must be a number") end
-end
-
-function checkOptionalTable(t: {any}?, name: string)
+local function checkOptionalTable(t: {any}?, name: string)
     if (t != nil and type(t) != "table") then error(name .. " must be a table") end
 end
 
-function checkEncoding(encoding: string, name: string)
+local function checkEncoding(encoding: string, name: string)
     checkString(encoding, name)
     if (ENCODINGS[encoding] == nil) then
         error(name .. " must be hex, base64 or base64url")
@@ -37,7 +33,7 @@ end
 
 -- Reads `options[key]` with a default, checking its type against the
 -- default's type when both are present.
-function option(options: {[string]: any}, key: string, default: any): any
+local function option(options: {[string]: any}, key: string, default: any): any
     local value = options[key]
     if (value == nil) then return default end
     if (default != nil and type(value) != type(default)) then
@@ -46,7 +42,7 @@ function option(options: {[string]: any}, key: string, default: any): any
     return value
 end
 
-function encodingOption(options: {[string]: any}, default: string): string
+local function encodingOption(options: {[string]: any}, default: string): string
     local encoding = option(options, "encoding", default)
     checkEncoding(encoding, "encoding")
     return encoding

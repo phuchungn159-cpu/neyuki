@@ -10,13 +10,14 @@ use crate::bytecode::proto::Proto;
 use crate::dap::DapSession;
 use crate::vm::frame::CallFrame;
 use crate::vm::gc::GcTracker;
-use crate::vm::hash::{FxHashMap, new_map};
+use crate::vm::hash::{FxHashMap, new_map, with_capacity};
 use crate::vm::libs::{
     create_bit_lib, create_buffer_lib, create_coroutine_lib, create_debug_lib, create_json_lib,
     create_math_lib, create_os_lib, create_string_lib, create_table_lib, create_task_lib,
     create_utf8_lib,
 };
 use crate::vm::ops;
+use crate::vm::table::TableKey;
 use crate::vm::value::{NativeDef, StrRef, Upvalue, Value, VmClosure, VmTable};
 
 pub const DEFAULT_MAX_CALL_DEPTH: usize = 512;
@@ -203,11 +204,157 @@ impl Default for VM {
     }
 }
 
+/// Returns whether `val` carries interior-mutable state that must not be
+/// shared across VM instances.
+fn value_has_mutable_state(val: &Value) -> bool {
+    if crate::vm::libs::json::is_null(val) {
+        // `json.null` is a frozen thread-local sentinel compared by `Rc::ptr_eq`.
+        return false;
+    }
+    matches!(val, Value::Table(_) | Value::Closure(_) | Value::Buffer(_))
+}
+
+fn table_needs_deep_clone(tbl: &VmTable) -> bool {
+    tbl.metatable.is_some()
+        || tbl.array.iter().any(value_has_mutable_state)
+        || tbl.fields.values().any(value_has_mutable_state)
+        || tbl.general.as_ref().is_some_and(|g| {
+            g.values()
+                .any(|(k, v)| value_has_mutable_state(k) || value_has_mutable_state(v))
+        })
+}
+
+fn deep_clone_value(val: &Value) -> Value {
+    if crate::vm::libs::json::is_null(val) {
+        return val.clone();
+    }
+    match val {
+        Value::Table(t) => Value::Table(deep_clone_table(&t.borrow())),
+        other => {
+            debug_assert!(
+                !value_has_mutable_state(other),
+                "unexpected mutable value in BuiltinTemplate: {}",
+                other.type_name()
+            );
+            other.clone()
+        }
+    }
+}
+
+fn deep_clone_table(tbl: &VmTable) -> Rc<RefCell<VmTable>> {
+    let mut out = VmTable::with_capacity(tbl.array.len(), tbl.fields.len());
+    out.frozen = tbl.frozen;
+    out.array_peak = tbl.array_peak;
+    for v in &tbl.array {
+        out.array.push(deep_clone_value(v));
+    }
+    for (k, v) in tbl.fields.iter() {
+        out.fields.insert(k.clone(), deep_clone_value(v));
+    }
+    if let Some(ref g) = tbl.general {
+        let mut new_g = with_capacity(g.len());
+        for (k, v) in g.values() {
+            let ck = deep_clone_value(k);
+            let cv = deep_clone_value(v);
+            if let Ok(tk) = TableKey::from_value(&ck) {
+                new_g.insert(tk, (ck, cv));
+            }
+        }
+        out.general = Some(Box::new(new_g));
+    }
+    if let Some(ref mt) = tbl.metatable {
+        out.metatable = Some(deep_clone_table(&mt.borrow()));
+    }
+    Rc::new(RefCell::new(out))
+}
+
+/// Pre-built per-thread template of globals and standard library tables.
+///
+/// Flat stdlib tables (containing only immutable natives/primitives and no
+/// metatable) clone in one pass; any table containing nested tables or a
+/// metatable is flagged for recursive deep cloning so no mutable table can
+/// ever be shared between VMs.
+struct BuiltinTemplate {
+    base_globals: FxHashMap<StrRef, Value>,
+    libs: Vec<(&'static str, StrRef, VmTable, bool)>,
+    bit32_key: StrRef,
+    g_key: StrRef,
+    g_meta: VmTable,
+    g_meta_needs_deep: bool,
+}
+
+impl BuiltinTemplate {
+    fn build() -> Self {
+        let mut scratch = VM::new_empty();
+        crate::vm::builtins::register_all(&mut scratch);
+        crate::vm::libs::register_natives(&mut scratch);
+
+        // Extract `_G`'s metatable template and remove `_G` from base_globals
+        // so every VM gets its own isolated `_G` table + metatable.
+        let g_key = StrRef::from("_G");
+        let g_meta = match scratch.globals.remove(&g_key) {
+            Some(Value::Table(t)) => t
+                .borrow()
+                .metatable
+                .as_ref()
+                .map(|m| m.borrow().clone())
+                .unwrap_or_default(),
+            _ => VmTable::new(),
+        };
+        let g_meta_needs_deep = table_needs_deep_clone(&g_meta);
+        debug_assert!(
+            !scratch.globals.values().any(value_has_mutable_state),
+            "base_globals template must not hold shared mutable values"
+        );
+
+        let raw_libs: [(&'static str, Value); 11] = [
+            ("bit", create_bit_lib()),
+            ("buffer", create_buffer_lib()),
+            ("coroutine", create_coroutine_lib()),
+            ("debug", create_debug_lib()),
+            ("json", create_json_lib()),
+            ("math", create_math_lib()),
+            ("os", create_os_lib()),
+            ("string", create_string_lib()),
+            ("table", create_table_lib()),
+            ("task", create_task_lib()),
+            ("utf8", create_utf8_lib()),
+        ];
+        let mut libs = Vec::with_capacity(raw_libs.len());
+        for (name, val) in raw_libs {
+            if let Value::Table(t) = val {
+                let tbl = t.borrow().clone();
+                let needs_deep = table_needs_deep_clone(&tbl);
+                libs.push((name, StrRef::from(name), tbl, needs_deep));
+            }
+        }
+        // Pre-reserve so cloning `base_globals` already has room for the 13
+        // library and `_G` entries without rehashing in `VM::new()`.
+        scratch.globals.reserve(libs.len() + 2);
+
+        Self {
+            base_globals: scratch.globals,
+            libs,
+            bit32_key: StrRef::from("bit32"),
+            g_key,
+            g_meta,
+            g_meta_needs_deep,
+        }
+    }
+}
+
+fn default_max_call_depth() -> usize {
+    std::env::var("NEYUKI_MAX_CALL_DEPTH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_CALL_DEPTH)
+}
+
 impl VM {
-    pub fn new() -> Self {
-        let mut vm = Self {
-            stack: Vec::with_capacity(256),
-            frames: Vec::with_capacity(64),
+    fn new_empty() -> Self {
+        Self {
+            stack: Vec::new(),
+            frames: Vec::new(),
             globals: new_map(),
             globals_epoch: 0,
             gc: GcTracker::new(),
@@ -232,13 +379,53 @@ impl VM {
             string_lib: Value::Nil,
             returned: Vec::new(),
             error_trace: None,
-            max_call_depth: std::env::var("NEYUKI_MAX_CALL_DEPTH")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(DEFAULT_MAX_CALL_DEPTH),
+            max_call_depth: default_max_call_depth(),
             tasks: Default::default(),
-        };
-        vm.register_builtins();
+        }
+    }
+
+    pub fn new() -> Self {
+        thread_local! {
+            static TEMPLATE: BuiltinTemplate = BuiltinTemplate::build();
+        }
+        let mut vm = Self::new_empty();
+        vm.stack.reserve(256);
+        vm.frames.reserve(64);
+        TEMPLATE.with(|tpl| {
+            let mut globals = tpl.base_globals.clone();
+            let mut modules = HashMap::with_capacity(tpl.libs.len() + 4);
+
+            let mut g_table = VmTable::new();
+            g_table.metatable = Some(if tpl.g_meta_needs_deep {
+                deep_clone_table(&tpl.g_meta)
+            } else {
+                Rc::new(RefCell::new(tpl.g_meta.clone()))
+            });
+            globals.insert(
+                tpl.g_key.clone(),
+                Value::Table(Rc::new(RefCell::new(g_table))),
+            );
+
+            for (name, key, tbl, needs_deep) in &tpl.libs {
+                let lib = Value::Table(if *needs_deep {
+                    deep_clone_table(tbl)
+                } else {
+                    Rc::new(RefCell::new(tbl.clone()))
+                });
+                if *name == "string" {
+                    vm.string_lib = lib.clone();
+                } else if *name == "bit" {
+                    globals.insert(tpl.bit32_key.clone(), lib.clone());
+                    modules.insert("bit32".to_string(), lib.clone());
+                }
+                globals.insert(key.clone(), lib.clone());
+                // `require("@neyuki/math")` hands back this same table even if
+                // the script later reassigns the global.
+                modules.insert((*name).to_string(), lib);
+            }
+            vm.globals = globals;
+            vm.modules = modules;
+        });
         vm
     }
 
@@ -255,36 +442,6 @@ impl VM {
     #[inline]
     pub(crate) fn call_depth(&self) -> usize {
         self.frames.len() + self.frames_below
-    }
-
-    fn register_builtins(&mut self) {
-        crate::vm::builtins::register_all(self);
-
-        let bit = create_bit_lib();
-        let libs = [
-            ("bit", bit.clone()),
-            ("bit32", bit),
-            ("buffer", create_buffer_lib()),
-            ("coroutine", create_coroutine_lib()),
-            ("debug", create_debug_lib()),
-            ("json", create_json_lib()),
-            ("math", create_math_lib()),
-            ("os", create_os_lib()),
-            ("string", create_string_lib()),
-            ("table", create_table_lib()),
-            ("task", create_task_lib()),
-            ("utf8", create_utf8_lib()),
-        ];
-        for (name, lib) in libs {
-            if name == "string" {
-                self.string_lib = lib.clone();
-            }
-            self.set_global(name, lib.clone());
-            // `require("@neyuki/math")` hands back this same table even if
-            // the script later reassigns the global.
-            self.modules.insert(name.to_string(), lib);
-        }
-        crate::vm::libs::register_natives(self);
     }
 
     pub fn set_global(&mut self, name: &str, value: Value) {
@@ -452,8 +609,13 @@ impl VM {
     /// Runs a module's top-level code and returns its value, leaving the
     /// frames and registers of whatever called `require` untouched.
     pub fn execute_module(&mut self, proto: Proto) -> Result<Value, String> {
+        self.execute_module_rc(Rc::new(proto))
+    }
+
+    /// Like `execute_module`, sharing an already-compiled `Rc<Proto>`.
+    pub fn execute_module_rc(&mut self, proto: Rc<Proto>) -> Result<Value, String> {
         let closure = Rc::new(VmClosure {
-            proto: Rc::new(proto),
+            proto,
             upvalues: Vec::new(),
         });
         let depth = self.frames.len();
@@ -3517,5 +3679,55 @@ return path .. \" \" .. params.name .. \" \" .. http.encode(\"a b\")";
         end
         return sum == 150 and count == 5";
         assert_eq!(run_code(code).to_string(), "true");
+    }
+
+    #[test]
+    fn test_deep_clone_table_isolates_nested_tables_and_metatables() {
+        let mut inner = VmTable::new();
+        inner.fields.insert(StrRef::from("sep"), Value::str("/"));
+        let mut mt = VmTable::new();
+        mt.fields.insert(StrRef::from("tag"), Value::Int(1));
+        let mut root = VmTable::new();
+        root.fields.insert(
+            StrRef::from("path"),
+            Value::Table(Rc::new(RefCell::new(inner))),
+        );
+        root.metatable = Some(Rc::new(RefCell::new(mt)));
+
+        assert!(table_needs_deep_clone(&root));
+        let clone1 = deep_clone_table(&root);
+        let clone2 = deep_clone_table(&root);
+
+        // Mutate nested table and metatable on clone1; clone2 and root must be untouched.
+        if let Some(Value::Table(p1)) = clone1.borrow().fields.get("path") {
+            p1.borrow_mut()
+                .fields
+                .insert(StrRef::from("sep"), Value::str("\\"));
+        }
+        clone1
+            .borrow()
+            .metatable
+            .as_ref()
+            .unwrap()
+            .borrow_mut()
+            .fields
+            .insert(StrRef::from("tag"), Value::Int(99));
+
+        let sep2 = match clone2.borrow().fields.get("path") {
+            Some(Value::Table(p2)) => p2.borrow().fields.get("sep").unwrap().to_string(),
+            _ => panic!("missing nested table"),
+        };
+        let tag2 = clone2
+            .borrow()
+            .metatable
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .fields
+            .get("tag")
+            .unwrap()
+            .clone();
+        assert_eq!(sep2, "/");
+        assert_eq!(tag2, Value::Int(1));
     }
 }

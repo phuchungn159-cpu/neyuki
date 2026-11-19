@@ -132,9 +132,9 @@ pub(crate) const NATIVES: &[NativeDef] = &[
 // Arguments
 // ---------------------------------------------------------------------------
 
-fn string_arg(args: &[Value], index: usize, name: &str) -> Result<String, String> {
+fn str_arg<'a>(args: &'a [Value], index: usize, name: &str) -> Result<&'a str, String> {
     match args.get(index) {
-        Some(Value::String(value)) => Ok(value.to_string()),
+        Some(Value::String(value)) => Ok(value),
         Some(value) => Err(format!(
             "{} must be a string, got {}",
             name,
@@ -145,10 +145,10 @@ fn string_arg(args: &[Value], index: usize, name: &str) -> Result<String, String
 }
 
 /// A string that may be absent; nil reads as the empty string.
-fn optional_string_arg(args: &[Value], index: usize, name: &str) -> Result<String, String> {
+fn optional_str_arg<'a>(args: &'a [Value], index: usize, name: &str) -> Result<&'a str, String> {
     match args.get(index) {
-        None | Some(Value::Nil) => Ok(String::new()),
-        _ => string_arg(args, index, name),
+        None | Some(Value::Nil) => Ok(""),
+        _ => str_arg(args, index, name),
     }
 }
 
@@ -220,7 +220,7 @@ const BASE64_URL: GeneralPurpose = GeneralPurpose::new(
 );
 
 fn encoding_arg(args: &[Value], index: usize) -> Result<Encoding, String> {
-    match string_arg(args, index, "encoding")?.as_str() {
+    match str_arg(args, index, "encoding")? {
         "hex" => Ok(Encoding::Hex),
         "base64" => Ok(Encoding::Base64),
         "base64url" => Ok(Encoding::Base64Url),
@@ -234,9 +234,11 @@ fn encoding_arg(args: &[Value], index: usize) -> Result<Encoding, String> {
 fn encode(bytes: &[u8], encoding: Encoding) -> String {
     match encoding {
         Encoding::Hex => {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
             let mut out = String::with_capacity(bytes.len() * 2);
-            for byte in bytes {
-                out.push_str(&format!("{:02x}", byte));
+            for &byte in bytes {
+                out.push(HEX[(byte >> 4) as usize] as char);
+                out.push(HEX[(byte & 0x0f) as usize] as char);
             }
             out
         }
@@ -275,14 +277,14 @@ fn decode(text: &str, encoding: Encoding, name: &str) -> Result<Vec<u8>, String>
 
 fn builtin_encode(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let encoding = encoding_arg(args, 0)?;
-    let data = string_arg(args, 1, "s")?;
+    let data = str_arg(args, 1, "s")?;
     Ok(string_value(encode(data.as_bytes(), encoding)))
 }
 
 fn builtin_decode(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let encoding = encoding_arg(args, 0)?;
-    let data = string_arg(args, 1, "s")?;
-    let bytes = decode(&data, encoding, "s")?;
+    let data = str_arg(args, 1, "s")?;
+    let bytes = decode(data, encoding, "s")?;
     Ok(string_value(utf8(bytes, "decoded data")?))
 }
 
@@ -362,20 +364,20 @@ macro_rules! with_digest {
 }
 
 fn builtin_hash(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let algorithm = string_arg(args, 0, "algorithm")?;
-    let data = string_arg(args, 1, "s")?;
+    let algorithm = str_arg(args, 0, "algorithm")?;
+    let data = str_arg(args, 1, "s")?;
     let encoding = encoding_arg(args, 2)?;
-    with_digest!(algorithm.as_str(), D => {
+    with_digest!(algorithm, D => {
         Ok(string_value(encode(&D::digest(data.as_bytes()), encoding)))
     })
 }
 
 fn builtin_hmac(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let algorithm = string_arg(args, 0, "algorithm")?;
-    let key = string_arg(args, 1, "key")?;
-    let data = string_arg(args, 2, "s")?;
+    let algorithm = str_arg(args, 0, "algorithm")?;
+    let key = str_arg(args, 1, "key")?;
+    let data = str_arg(args, 2, "s")?;
     let encoding = encoding_arg(args, 3)?;
-    with_hmac_digest!(algorithm.as_str(), D => {
+    with_hmac_digest!(algorithm, D => {
         // HMAC accepts keys of any length, so this cannot fail.
         let mut mac = <Hmac<D> as Mac>::new_from_slice(key.as_bytes())
             .map_err(|err| format!("invalid hmac key: {}", err))?;
@@ -387,15 +389,15 @@ fn builtin_hmac(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 /// Constant-time equality, for comparing MACs and tokens without leaking
 /// how many leading bytes matched.
 fn builtin_equals(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let a = string_arg(args, 0, "a")?;
-    let b = string_arg(args, 1, "b")?;
+    let a = str_arg(args, 0, "a")?;
+    let b = str_arg(args, 1, "b")?;
     Ok(vec![Value::Bool(a.as_bytes().ct_eq(b.as_bytes()).into())])
 }
 
 fn builtin_pbkdf2(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let algorithm = string_arg(args, 0, "algorithm")?;
-    let password = string_arg(args, 1, "password")?;
-    let salt = string_arg(args, 2, "salt")?;
+    let algorithm = str_arg(args, 0, "algorithm")?;
+    let password = str_arg(args, 1, "password")?;
+    let salt = str_arg(args, 2, "salt")?;
     let iterations = size_arg(args, 3, "iterations")?;
     let length = length_arg(args, 4, "length")?;
     let encoding = encoding_arg(args, 5)?;
@@ -405,24 +407,24 @@ fn builtin_pbkdf2(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let iterations =
         u32::try_from(iterations).map_err(|_| "iterations is too large".to_string())?;
     let mut out = vec![0u8; length];
-    with_hmac_digest!(algorithm.as_str(), D => {
+    with_hmac_digest!(algorithm, D => {
         pbkdf2::pbkdf2_hmac::<D>(password.as_bytes(), salt.as_bytes(), iterations, &mut out);
         Ok(string_value(encode(&out, encoding)))
     })
 }
 
 fn builtin_hkdf(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let algorithm = string_arg(args, 0, "algorithm")?;
-    let key = string_arg(args, 1, "key")?;
-    let salt = optional_string_arg(args, 2, "salt")?;
-    let info = optional_string_arg(args, 3, "info")?;
+    let algorithm = str_arg(args, 0, "algorithm")?;
+    let key = str_arg(args, 1, "key")?;
+    let salt = optional_str_arg(args, 2, "salt")?;
+    let info = optional_str_arg(args, 3, "info")?;
     let length = length_arg(args, 4, "length")?;
     let encoding = encoding_arg(args, 5)?;
     // The input is key material (a shared secret, a master key), which is
     // binary and so arrives encoded like every other key.
-    let key = decode(&key, encoding, "key")?;
+    let key = decode(key, encoding, "key")?;
     let mut out = vec![0u8; length];
-    with_hmac_digest!(algorithm.as_str(), D => {
+    with_hmac_digest!(algorithm, D => {
         let salt = if salt.is_empty() { None } else { Some(salt.as_bytes()) };
         hkdf::Hkdf::<D>::new(salt, &key)
             .expand(info.as_bytes(), &mut out)
@@ -436,12 +438,12 @@ fn builtin_hkdf(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 // ---------------------------------------------------------------------------
 
 fn builtin_password_hash(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let algorithm = string_arg(args, 0, "algorithm")?;
-    let password = string_arg(args, 1, "password")?;
+    let algorithm = str_arg(args, 0, "algorithm")?;
+    let password = str_arg(args, 1, "password")?;
     let cost = size_arg(args, 2, "cost")?;
     let memory = size_arg(args, 3, "memory")?;
     let parallelism = size_arg(args, 4, "parallelism")?;
-    let hash = match algorithm.as_str() {
+    let hash = match algorithm {
         "argon2id" => {
             if memory > MAX_ARGON2_MEMORY {
                 return Err(format!(
@@ -473,7 +475,7 @@ fn builtin_password_hash(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, Str
             if password.len() > 72 {
                 return Err("bcrypt passwords must be at most 72 bytes".to_string());
             }
-            bcrypt::hash(&password, cost).map_err(|err| format!("bcrypt failed: {}", err))?
+            bcrypt::hash(password, cost).map_err(|err| format!("bcrypt failed: {}", err))?
         }
         other => return Err(format!("unknown password hash algorithm, '{}'", other)),
     };
@@ -483,11 +485,11 @@ fn builtin_password_hash(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, Str
 /// Verifies against whichever scheme produced the hash, so a stored hash can
 /// be checked without remembering how it was made.
 fn builtin_password_verify(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let password = string_arg(args, 0, "password")?;
-    let hash = string_arg(args, 1, "hash")?;
+    let password = str_arg(args, 0, "password")?;
+    let hash = str_arg(args, 1, "hash")?;
     let matches = if hash.starts_with("$argon2") {
         let parsed =
-            PasswordHash::new(&hash).map_err(|err| format!("invalid argon2 hash: {}", err))?;
+            PasswordHash::new(hash).map_err(|err| format!("invalid argon2 hash: {}", err))?;
         // The PHC parser accepts `$argon2id$salt` alone; without both parts
         // there is nothing to verify against, which should not read as
         // "wrong password".
@@ -500,7 +502,7 @@ fn builtin_password_verify(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, S
             Err(err) => return Err(format!("invalid argon2 hash: {}", err)),
         }
     } else if hash.starts_with("$2") {
-        bcrypt::verify(&password, &hash).map_err(|err| format!("invalid bcrypt hash: {}", err))?
+        bcrypt::verify(password, hash).map_err(|err| format!("invalid bcrypt hash: {}", err))?
     } else {
         return Err("hash is not an argon2 or bcrypt hash".to_string());
     };
@@ -580,9 +582,9 @@ fn open<A: Aead + KeyInit>(key: &[u8], data: &[u8], aad: &[u8]) -> Result<Vec<u8
 }
 
 fn builtin_generate_key(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let algorithm = string_arg(args, 0, "algorithm")?;
+    let algorithm = str_arg(args, 0, "algorithm")?;
     let encoding = encoding_arg(args, 1)?;
-    with_cipher!(algorithm.as_str(), A => {
+    with_cipher!(algorithm, A => {
         let mut key = vec![0u8; A::key_size()];
         OsRng.fill_bytes(&mut key);
         Ok(string_value(encode(&key, encoding)))
@@ -590,27 +592,27 @@ fn builtin_generate_key(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, Stri
 }
 
 fn builtin_encrypt(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let algorithm = string_arg(args, 0, "algorithm")?;
-    let key = string_arg(args, 1, "key")?;
-    let plaintext = string_arg(args, 2, "s")?;
-    let aad = optional_string_arg(args, 3, "aad")?;
+    let algorithm = str_arg(args, 0, "algorithm")?;
+    let key = str_arg(args, 1, "key")?;
+    let plaintext = str_arg(args, 2, "s")?;
+    let aad = optional_str_arg(args, 3, "aad")?;
     let encoding = encoding_arg(args, 4)?;
-    let key = decode(&key, encoding, "key")?;
-    with_cipher!(algorithm.as_str(), A => {
+    let key = decode(key, encoding, "key")?;
+    with_cipher!(algorithm, A => {
         let sealed = seal::<A>(&key, plaintext.as_bytes(), aad.as_bytes())?;
         Ok(string_value(encode(&sealed, encoding)))
     })
 }
 
 fn builtin_decrypt(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let algorithm = string_arg(args, 0, "algorithm")?;
-    let key = string_arg(args, 1, "key")?;
-    let ciphertext = string_arg(args, 2, "s")?;
-    let aad = optional_string_arg(args, 3, "aad")?;
+    let algorithm = str_arg(args, 0, "algorithm")?;
+    let key = str_arg(args, 1, "key")?;
+    let ciphertext = str_arg(args, 2, "s")?;
+    let aad = optional_str_arg(args, 3, "aad")?;
     let encoding = encoding_arg(args, 4)?;
-    let key = decode(&key, encoding, "key")?;
-    let data = decode(&ciphertext, encoding, "s")?;
-    with_cipher!(algorithm.as_str(), A => {
+    let key = decode(key, encoding, "key")?;
+    let data = decode(ciphertext, encoding, "s")?;
+    with_cipher!(algorithm, A => {
         let plaintext = open::<A>(&key, &data, aad.as_bytes())?;
         Ok(string_value(utf8(plaintext, "decrypted data")?))
     })
@@ -775,9 +777,9 @@ fn parse_public_key(pem: &str) -> Result<PublicKey, String> {
 }
 
 fn builtin_generate_keypair(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let algorithm = string_arg(args, 0, "algorithm")?;
+    let algorithm = str_arg(args, 0, "algorithm")?;
     let bits = size_arg(args, 1, "bits")?;
-    let key = match algorithm.as_str() {
+    let key = match algorithm {
         "rsa" => {
             if !(1024..=8192).contains(&bits) {
                 return Err("bits must be between 1024 and 8192".to_string());
@@ -797,10 +799,8 @@ fn builtin_generate_keypair(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, 
 }
 
 fn builtin_public_key(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let pem = string_arg(args, 0, "privateKey")?;
-    Ok(string_value(
-        parse_private_key(&pem)?.public_key().to_pem()?,
-    ))
+    let pem = str_arg(args, 0, "privateKey")?;
+    Ok(string_value(parse_private_key(pem)?.public_key().to_pem()?))
 }
 
 // ---------------------------------------------------------------------------
@@ -883,13 +883,13 @@ fn rsa_verify(
 }
 
 fn builtin_sign(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let pem = string_arg(args, 0, "privateKey")?;
-    let message = string_arg(args, 1, "s")?;
-    let hash = string_arg(args, 2, "hash")?;
-    let padding = string_arg(args, 3, "padding")?;
+    let pem = str_arg(args, 0, "privateKey")?;
+    let message = str_arg(args, 1, "s")?;
+    let hash = str_arg(args, 2, "hash")?;
+    let padding = str_arg(args, 3, "padding")?;
     let encoding = encoding_arg(args, 4)?;
-    let signature = match parse_private_key(&pem)? {
-        PrivateKey::Rsa(key) => rsa_sign(key, message.as_bytes(), &hash, &padding)?,
+    let signature = match parse_private_key(pem)? {
+        PrivateKey::Rsa(key) => rsa_sign(key, message.as_bytes(), hash, padding)?,
         PrivateKey::Ed25519(key) => key.sign(message.as_bytes()).to_vec(),
         key => {
             return Err(format!(
@@ -902,18 +902,18 @@ fn builtin_sign(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 }
 
 fn builtin_verify(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let pem = string_arg(args, 0, "publicKey")?;
-    let message = string_arg(args, 1, "s")?;
-    let signature = string_arg(args, 2, "signature")?;
-    let hash = string_arg(args, 3, "hash")?;
-    let padding = string_arg(args, 4, "padding")?;
+    let pem = str_arg(args, 0, "publicKey")?;
+    let message = str_arg(args, 1, "s")?;
+    let signature = str_arg(args, 2, "signature")?;
+    let hash = str_arg(args, 3, "hash")?;
+    let padding = str_arg(args, 4, "padding")?;
     let encoding = encoding_arg(args, 5)?;
     // A malformed signature is simply not a valid one.
-    let Ok(signature) = decode(&signature, encoding, "signature") else {
+    let Ok(signature) = decode(signature, encoding, "signature") else {
         return Ok(vec![Value::Bool(false)]);
     };
-    let valid = match parse_public_key(&pem)? {
-        PublicKey::Rsa(key) => rsa_verify(key, message.as_bytes(), &signature, &hash, &padding)?,
+    let valid = match parse_public_key(pem)? {
+        PublicKey::Rsa(key) => rsa_verify(key, message.as_bytes(), &signature, hash, padding)?,
         PublicKey::Ed25519(key) => ed25519_dalek::Signature::from_slice(&signature)
             .is_ok_and(|signature| key.verify_strict(message.as_bytes(), &signature).is_ok()),
         key => {
@@ -927,14 +927,14 @@ fn builtin_verify(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
 }
 
 fn builtin_public_encrypt(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let pem = string_arg(args, 0, "publicKey")?;
-    let message = string_arg(args, 1, "s")?;
-    let hash = string_arg(args, 2, "hash")?;
+    let pem = str_arg(args, 0, "publicKey")?;
+    let message = str_arg(args, 1, "s")?;
+    let hash = str_arg(args, 2, "hash")?;
     let encoding = encoding_arg(args, 3)?;
-    let PublicKey::Rsa(key) = parse_public_key(&pem)? else {
+    let PublicKey::Rsa(key) = parse_public_key(pem)? else {
         return Err("publicEncrypt needs an rsa key".to_string());
     };
-    let sealed = with_rsa_digest!(hash.as_str(), D => {
+    let sealed = with_rsa_digest!(hash, D => {
         key.encrypt(&mut OsRng, Oaep::new::<D>(), message.as_bytes())
             .map_err(|err| format!("rsa encryption failed: {}", err))
     })?;
@@ -942,15 +942,15 @@ fn builtin_public_encrypt(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, St
 }
 
 fn builtin_private_decrypt(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let pem = string_arg(args, 0, "privateKey")?;
-    let ciphertext = string_arg(args, 1, "s")?;
-    let hash = string_arg(args, 2, "hash")?;
+    let pem = str_arg(args, 0, "privateKey")?;
+    let ciphertext = str_arg(args, 1, "s")?;
+    let hash = str_arg(args, 2, "hash")?;
     let encoding = encoding_arg(args, 3)?;
-    let PrivateKey::Rsa(key) = parse_private_key(&pem)? else {
+    let PrivateKey::Rsa(key) = parse_private_key(pem)? else {
         return Err("privateDecrypt needs an rsa key".to_string());
     };
-    let data = decode(&ciphertext, encoding, "s")?;
-    let plaintext = with_rsa_digest!(hash.as_str(), D => {
+    let data = decode(ciphertext, encoding, "s")?;
+    let plaintext = with_rsa_digest!(hash, D => {
         key.decrypt(Oaep::new::<D>(), &data)
             .map_err(|_| "rsa decryption failed: wrong key or corrupted data".to_string())
     })?;
@@ -958,13 +958,13 @@ fn builtin_private_decrypt(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, S
 }
 
 fn builtin_shared_secret(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
-    let private = string_arg(args, 0, "privateKey")?;
-    let public = string_arg(args, 1, "publicKey")?;
+    let private = str_arg(args, 0, "privateKey")?;
+    let public = str_arg(args, 1, "publicKey")?;
     let encoding = encoding_arg(args, 2)?;
-    let PrivateKey::X25519(private) = parse_private_key(&private)? else {
+    let PrivateKey::X25519(private) = parse_private_key(private)? else {
         return Err("sharedSecret needs x25519 keys".to_string());
     };
-    let PublicKey::X25519(public) = parse_public_key(&public)? else {
+    let PublicKey::X25519(public) = parse_public_key(public)? else {
         return Err("sharedSecret needs x25519 keys".to_string());
     };
     let secret = private.diffie_hellman(&public);
