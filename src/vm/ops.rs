@@ -5,7 +5,7 @@
 // result overflows. Results always go through `Value::from_bigint`, which
 // demotes back to `Int` whenever the answer fits.
 
-use num_bigint::{BigInt, Sign};
+use num_bigint::{BigInt, BigUint, Sign};
 use num_integer::Integer as _;
 use num_traits::{FromPrimitive, Signed, ToPrimitive, Zero};
 use std::rc::Rc;
@@ -79,12 +79,342 @@ fn i64_bits(val: i64) -> u64 {
 
 #[inline]
 pub fn bigint_rem_u64(bi: &BigInt, divisor: u64) -> u64 {
+    if let Some(u) = bi.magnitude().to_u128() {
+        return (u % (divisor as u128)) as u64;
+    }
     let mut rem: u128 = 0;
     let div128 = divisor as u128;
     for digit in bi.iter_u64_digits().rev() {
         rem = ((rem << 64) | (digit as u128)) % div128;
     }
     rem as u64
+}
+
+/// Non-negative `BigInt` divided by a positive `u64` using hardware 128-bit
+/// limb division, avoiding `num_bigint`'s intermediate remainder allocation.
+#[inline]
+fn bigint_div_u64(ia: &BigInt, divisor: u64) -> Value {
+    if let Some(u) = ia.to_u128() {
+        return Value::from_u128(u / divisor as u128);
+    }
+    let div128 = divisor as u128;
+    let mut rem: u128 = 0;
+    let u64_len = ia.iter_u64_digits().len();
+    let mut q_u32 = vec![0u32; u64_len * 2];
+    for (i, digit) in ia.iter_u64_digits().enumerate().rev() {
+        let cur = (rem << 64) | (digit as u128);
+        let q = (cur / div128) as u64;
+        rem = cur % div128;
+        q_u32[i * 2] = q as u32;
+        q_u32[i * 2 + 1] = (q >> 32) as u32;
+    }
+    Value::from_bigint(BigInt::from_biguint(Sign::Plus, BigUint::new(q_u32)))
+}
+
+/// Normalizes a `Value::BigInt` slot back to `Value::Int` if an in-place
+/// mutation shrunk it into the `i64` range.
+#[inline]
+fn demote_if_small(slot: &mut Value) {
+    if let Value::BigInt(rc) = slot
+        && rc.bits() <= 64
+        && let Some(i) = rc.to_i64()
+    {
+        *slot = Value::Int(i);
+    }
+}
+
+/// Mutates `stack[slot]` in place when it holds a uniquely-owned `Rc<BigInt>`
+/// (`strong_count == 1`), then demotes back to `Value::Int` if it fits in
+/// `i64`. Returns `true` when mutated in place.
+#[inline]
+fn mutate_unique_bigint(stack: &mut [Value], slot: usize, f: impl FnOnce(&mut BigInt)) -> bool {
+    if let Value::BigInt(rc) = &mut stack[slot]
+        && let Some(big) = Rc::get_mut(rc)
+    {
+        f(big);
+        demote_if_small(&mut stack[slot]);
+        return true;
+    }
+    false
+}
+
+/// Mutates `stack[dst]` in place against `stack[other]` (`dst != other`) when
+/// `stack[dst]` holds a uniquely-owned `Rc<BigInt>`, then demotes back to
+/// `Value::Int` if it fits in `i64`.
+#[inline]
+fn mutate_unique_bigint_with(
+    stack: &mut [Value],
+    dst: usize,
+    other: usize,
+    f: impl FnOnce(&mut BigInt, &Value),
+) -> bool {
+    debug_assert_ne!(dst, other);
+    if !matches!(&stack[dst], Value::BigInt(rc) if Rc::strong_count(rc) == 1) {
+        return false;
+    }
+    let (dst_slot, other_slot): (&mut Value, &Value) = if dst < other {
+        let (left, right) = stack.split_at_mut(other);
+        (&mut left[dst], &right[0])
+    } else {
+        let (left, right) = stack.split_at_mut(dst);
+        (&mut right[0], &left[other])
+    };
+    if let Value::BigInt(rc) = dst_slot
+        && let Some(big) = Rc::get_mut(rc)
+    {
+        f(big, other_slot);
+        demote_if_small(dst_slot);
+        return true;
+    }
+    false
+}
+
+/// Evaluates `stack[dst] = stack[a] + stack[b]` in one pass (no redundant type
+/// or bit-width checks), mutating in place when `dst` aliases a uniquely-owned
+/// `BigInt` operand.
+#[inline]
+pub fn eval_add_into(stack: &mut [Value], dst: usize, a: usize, b: usize) -> Result<(), String> {
+    let bits_needed = match (&stack[a], &stack[b]) {
+        (Value::BigInt(ia), Value::BigInt(ib)) => Some(ia.bits().max(ib.bits()) + 1),
+        (Value::BigInt(ia), Value::Int(_)) => Some(ia.bits().max(64) + 1),
+        (Value::Int(_), Value::BigInt(ib)) => Some(ib.bits().max(64) + 1),
+        _ => None,
+    };
+    if let Some(bits) = bits_needed {
+        check_int_bits(bits)?;
+        if dst == a && dst == b {
+            if mutate_unique_bigint(stack, dst, |big| *big <<= 1) {
+                return Ok(());
+            }
+        } else if dst == a || dst == b {
+            let other = if dst == a { b } else { a };
+            if mutate_unique_bigint_with(stack, dst, other, |big, rhs| match rhs {
+                Value::BigInt(rb) => *big += &**rb,
+                Value::Int(ib) => *big += *ib,
+                _ => unreachable!("checked above"),
+            }) {
+                return Ok(());
+            }
+        }
+        let res = match (&stack[a], &stack[b]) {
+            (Value::BigInt(ia), Value::Int(ib)) => Value::from_bigint(&**ia + *ib),
+            (Value::Int(ia), Value::BigInt(ib)) => Value::from_bigint(*ia + &**ib),
+            (Value::BigInt(ia), Value::BigInt(ib)) => {
+                if ia.is_negative() == ib.is_negative() {
+                    Value::BigInt(Rc::new(&**ia + &**ib))
+                } else {
+                    Value::from_bigint(&**ia + &**ib)
+                }
+            }
+            _ => unreachable!("checked above"),
+        };
+        stack[dst] = res;
+        return Ok(());
+    }
+    stack[dst] = eval_add(&stack[a], &stack[b])?;
+    Ok(())
+}
+
+/// Evaluates `stack[dst] = stack[a] - stack[b]` in one pass, mutating in place
+/// when `dst == a` holds a uniquely-owned `BigInt`.
+#[inline]
+pub fn eval_sub_into(stack: &mut [Value], dst: usize, a: usize, b: usize) -> Result<(), String> {
+    let bits_needed = match (&stack[a], &stack[b]) {
+        (Value::BigInt(ia), Value::BigInt(ib)) => Some(ia.bits().max(ib.bits()) + 1),
+        (Value::BigInt(ia), Value::Int(_)) => Some(ia.bits().max(64) + 1),
+        (Value::Int(_), Value::BigInt(ib)) => Some(ib.bits().max(64) + 1),
+        _ => None,
+    };
+    if let Some(bits) = bits_needed {
+        check_int_bits(bits)?;
+        if dst == a && dst == b {
+            stack[dst] = Value::Int(0);
+            return Ok(());
+        }
+        if dst == a
+            && mutate_unique_bigint_with(stack, dst, b, |big, rhs| match rhs {
+                Value::BigInt(rb) => *big -= &**rb,
+                Value::Int(ib) => *big -= *ib,
+                _ => unreachable!("checked above"),
+            })
+        {
+            return Ok(());
+        }
+        let res = match (&stack[a], &stack[b]) {
+            (Value::BigInt(ia), Value::Int(ib)) => Value::from_bigint(&**ia - *ib),
+            (Value::Int(ia), Value::BigInt(ib)) => Value::from_bigint(*ia - &**ib),
+            (Value::BigInt(ia), Value::BigInt(ib)) => {
+                if ia.is_negative() != ib.is_negative() {
+                    Value::BigInt(Rc::new(&**ia - &**ib))
+                } else {
+                    Value::from_bigint(&**ia - &**ib)
+                }
+            }
+            _ => unreachable!("checked above"),
+        };
+        stack[dst] = res;
+        return Ok(());
+    }
+    stack[dst] = eval_sub(&stack[a], &stack[b])?;
+    Ok(())
+}
+
+/// Shared single-pass evaluator for commutative bitwise operators (`&`, `|`,
+/// `^`) on `BigInt` operands, reusing a uniquely-owned destination operand.
+#[inline]
+fn eval_bitop_into(
+    stack: &mut [Value],
+    dst: usize,
+    a: usize,
+    b: usize,
+    assign_op: fn(&mut BigInt, &BigInt),
+    fallback: fn(&Value, &Value) -> Result<Value, String>,
+) -> Result<(), String> {
+    if (dst == a || dst == b)
+        && matches!(
+            (&stack[a], &stack[b]),
+            (Value::BigInt(_), Value::BigInt(_))
+                | (Value::BigInt(_), Value::Int(_))
+                | (Value::Int(_), Value::BigInt(_))
+        )
+    {
+        if dst == a && dst == b {
+            // `x & x == x`, `x | x == x`, `x ^ x == 0` handled cleanly by fallback.
+        } else {
+            let other = if dst == a { b } else { a };
+            if mutate_unique_bigint_with(stack, dst, other, |big, rhs| match rhs {
+                Value::BigInt(rb) => assign_op(big, rb),
+                Value::Int(ib) => assign_op(big, &BigInt::from(*ib)),
+                _ => unreachable!("checked above"),
+            }) {
+                return Ok(());
+            }
+        }
+    }
+    stack[dst] = fallback(&stack[a], &stack[b])?;
+    Ok(())
+}
+
+#[inline]
+pub fn eval_bitand_into(stack: &mut [Value], dst: usize, a: usize, b: usize) -> Result<(), String> {
+    eval_bitop_into(stack, dst, a, b, |x, y| *x &= y, eval_bitand)
+}
+
+#[inline]
+pub fn eval_bitor_into(stack: &mut [Value], dst: usize, a: usize, b: usize) -> Result<(), String> {
+    eval_bitop_into(stack, dst, a, b, |x, y| *x |= y, eval_bitor)
+}
+
+#[inline]
+pub fn eval_bitxor_into(stack: &mut [Value], dst: usize, a: usize, b: usize) -> Result<(), String> {
+    eval_bitop_into(stack, dst, a, b, |x, y| *x ^= y, eval_bitxor)
+}
+
+/// Evaluates `stack[dst] = -stack[src]`, flipping the sign of a uniquely-owned
+/// `BigInt` in place without allocating when `dst == src`.
+#[inline]
+pub fn eval_unm_into(stack: &mut [Value], dst: usize, src: usize) -> Result<(), String> {
+    if dst == src && mutate_unique_bigint(stack, dst, |big| *big = -std::mem::take(big)) {
+        return Ok(());
+    }
+    stack[dst] = eval_unm(&stack[src])?;
+    Ok(())
+}
+
+/// Evaluates `stack[dst] = stack[a] << shift` for a non-negative `u64` shift
+/// on a `BigInt`, mutating in place when `dst == a` is uniquely owned.
+#[inline]
+pub fn eval_shl_bigint_into(
+    stack: &mut [Value],
+    dst: usize,
+    a: usize,
+    shift: u64,
+) -> Result<(), String> {
+    let Value::BigInt(src) = &stack[a] else {
+        unreachable!("caller matched Value::BigInt");
+    };
+    if src.is_zero() {
+        stack[dst] = Value::Int(0);
+        return Ok(());
+    }
+    // Check total bit width in `u64` before casting `shift` to `usize` so
+    // shifts >= 2^32 never truncate on 32-bit targets.
+    check_int_bits(src.bits().saturating_add(shift))?;
+    let shift_usize = shift as usize;
+    if dst == a && mutate_unique_bigint(stack, dst, |big| *big <<= shift_usize) {
+        return Ok(());
+    }
+    let Value::BigInt(src) = &stack[a] else {
+        unreachable!("caller matched Value::BigInt");
+    };
+    stack[dst] = Value::BigInt(Rc::new(&**src << shift_usize));
+    Ok(())
+}
+
+/// Fast arithmetic right shift on a `BigInt` for a `u64` shift count.
+/// Checks `shift >= b.bits()` in `u64` before narrowing to `usize` so large
+/// shifts never truncate on 32-bit targets (`wasm32`, `i686`).
+#[inline]
+pub fn bigint_shr_u64(b: &BigInt, shift: u64) -> Value {
+    if shift >= b.bits() {
+        return Value::Int(if b.is_negative() { -1 } else { 0 });
+    }
+    let shift_usize = shift as usize;
+    if b.bits() <= 128 {
+        if !b.is_negative() {
+            if let Some(u) = b.to_u128() {
+                return Value::from_u128(u >> shift_usize);
+            }
+        } else if let Some(m) = b.magnitude().to_u128() {
+            // Floor arithmetic shift for negative `-m` (m >= 1):
+            // `(-m) >> shift == -(((m - 1) >> shift) + 1)`.
+            let mag = ((m - 1) >> shift_usize) + 1;
+            const I64_MIN_MAG: u128 = 1u128 << 63;
+            if mag < I64_MIN_MAG {
+                return Value::Int(-(mag as i64));
+            } else if mag == I64_MIN_MAG {
+                return Value::Int(i64::MIN);
+            } else {
+                return Value::BigInt(Rc::new(BigInt::from_biguint(
+                    Sign::Minus,
+                    BigUint::from(mag),
+                )));
+            }
+        }
+    }
+    Value::from_bigint(b >> shift_usize)
+}
+
+/// Evaluates `stack[dst] = stack[a] >> shift` for a non-negative `u64` shift
+/// on a `BigInt` in one pass, mutating in place when `dst == a` is uniquely
+/// owned.
+#[inline]
+pub fn eval_shr_bigint_into(stack: &mut [Value], dst: usize, a: usize, shift: u64) {
+    let Value::BigInt(src) = &stack[a] else {
+        unreachable!("caller matched Value::BigInt");
+    };
+    if shift == 0 {
+        if dst != a {
+            stack[dst] = Value::BigInt(Rc::clone(src));
+        }
+        return;
+    }
+    if shift >= src.bits() {
+        stack[dst] = Value::Int(if src.is_negative() { -1 } else { 0 });
+        return;
+    }
+    if src.bits() <= 128 && src.bits() - shift <= 63 {
+        stack[dst] = bigint_shr_u64(src, shift);
+        return;
+    }
+    let shift_usize = shift as usize;
+    if dst == a && mutate_unique_bigint(stack, dst, |big| *big >>= shift_usize) {
+        return;
+    }
+    let Value::BigInt(src) = &stack[a] else {
+        unreachable!("caller matched Value::BigInt");
+    };
+    stack[dst] = bigint_shr_u64(src, shift);
 }
 
 #[inline]
@@ -254,7 +584,7 @@ pub fn eval_idiv(a: &Value, b: &Value) -> Result<Value, String> {
                 return Ok(Value::from_bigint(-&**ia));
             }
             if !ia.is_negative() && *ib > 0 {
-                return Ok(Value::from_bigint(&**ia / *ib));
+                return Ok(bigint_div_u64(ia, *ib as u64));
             }
             Ok(Value::from_bigint(ia.div_floor(&BigInt::from(*ib))))
         }
@@ -273,6 +603,12 @@ pub fn eval_idiv(a: &Value, b: &Value) -> Result<Value, String> {
                 return Err("division by zero".to_string());
             }
             if !ia.is_negative() && !ib.is_negative() {
+                if let (Some(ua), Some(ub)) = (ia.to_u128(), ib.to_u128()) {
+                    return Ok(Value::from_u128(ua / ub));
+                }
+                if let Some(ub) = ib.to_u64() {
+                    return Ok(bigint_div_u64(ia, ub));
+                }
                 Ok(Value::from_bigint(&**ia / &**ib))
             } else {
                 Ok(Value::from_bigint(ia.div_floor(&**ib)))
@@ -529,13 +865,7 @@ fn shift_right(ia: &Value, shift: usize) -> Result<Value, String> {
         } else {
             i >> shift
         })),
-        Value::BigInt(b) => {
-            if shift as u64 >= b.bits() {
-                Ok(Value::Int(if b.is_negative() { -1 } else { 0 }))
-            } else {
-                Ok(Value::from_bigint(&**b >> shift))
-            }
-        }
+        Value::BigInt(b) => Ok(bigint_shr_u64(b, shift as u64)),
         _ => {
             let big = to_bigint_cow(ia)?;
             if shift as u64 >= big.bits() {
@@ -846,5 +1176,197 @@ mod tests {
         for (val, expected) in test_cases {
             assert_eq!(low_word(&val).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn test_bigint_shr_u64_equivalence_and_32bit_shift_range() {
+        let values = [
+            BigInt::from(1i64) << 63u32,
+            (BigInt::from(1i64) << 64u32) - 1i64,
+            BigInt::from(1i64) << 64u32,
+            (BigInt::from(1i64) << 64u32) + 1i64,
+            (BigInt::from(1i64) << 100u32) + BigInt::from(0xdead_beef_u64),
+            (BigInt::from(1i64) << 128u32) - 1i64,
+            BigInt::from(1i64) << 128u32,
+            (BigInt::from(1i64) << 200u32) + BigInt::from(123456789i64),
+            -((BigInt::from(1i64) << 63u32) + 1i64),
+            -((BigInt::from(1i64) << 64u32) - 1i64),
+            -(BigInt::from(1i64) << 64u32),
+            -((BigInt::from(1i64) << 64u32) + 1i64),
+            -((BigInt::from(1i64) << 100u32) + BigInt::from(0xdead_beef_u64)),
+            -((BigInt::from(1i64) << 128u32) - 1i64),
+            -(BigInt::from(1i64) << 128u32),
+            -((BigInt::from(1i64) << 200u32) + BigInt::from(123456789i64)),
+        ];
+        let shifts = [0u64, 1, 2, 15, 20, 63, 64, 65, 127, 128, 200, 256];
+
+        for b in &values {
+            for &shift in &shifts {
+                let got = bigint_shr_u64(b, shift);
+                let expected = Value::from_bigint(b >> (shift as usize));
+                assert_eq!(got, expected, "shr mismatch for {b} >> {shift}");
+                if let Value::BigInt(ref bi) = got {
+                    assert!(
+                        bi.to_i64().is_none(),
+                        "unnormalized BigInt from {b} >> {shift}: {bi}"
+                    );
+                }
+            }
+            // Shift >= 2^32 must check `u64` range before narrowing to `usize`
+            // so 32-bit targets never truncate `1u64 << 32` to `0`.
+            let huge_shift = 1u64 << 32;
+            let expected_huge = Value::Int(if b.is_negative() { -1 } else { 0 });
+            assert_eq!(bigint_shr_u64(b, huge_shift), expected_huge);
+            let mut stack = vec![Value::BigInt(Rc::new(b.clone()))];
+            eval_shr_bigint_into(&mut stack, 0, 0, huge_shift);
+            assert_eq!(stack[0], expected_huge);
+        }
+        // Explicit i64::MIN boundary checks
+        assert_eq!(
+            bigint_shr_u64(&(-(BigInt::from(1i64) << 64u32)), 1),
+            Value::Int(i64::MIN)
+        );
+        assert_eq!(
+            bigint_shr_u64(&(-((BigInt::from(1i64) << 64u32) - 1i64)), 1),
+            Value::Int(i64::MIN)
+        );
+        assert!(matches!(
+            bigint_shr_u64(&(-((BigInt::from(1i64) << 64u32) + 1i64)), 1),
+            Value::BigInt(_)
+        ));
+    }
+
+    #[test]
+    fn test_bigint_idiv_u128_and_u64_limb_equivalence() {
+        let dividends = [
+            BigInt::from(1i64) << 63u32,
+            (BigInt::from(1i64) << 100u32) + BigInt::from(987654321i64),
+            (BigInt::from(1i64) << 128u32) - 1i64,
+            BigInt::from(1i64) << 128u32,
+            (BigInt::from(1i64) << 192u32) + (BigInt::from(0xffff_ffff_u64) << 64u32) + 42i64,
+            (BigInt::from(1i64) << 256u32) - 1i64,
+            -((BigInt::from(1i64) << 130u32) + 17i64),
+        ];
+        let divisors_big = [
+            BigInt::from(1i64) << 63u32,
+            (BigInt::from(1i64) << 64u32) - 1i64,
+            (BigInt::from(1i64) << 80u32) + 12345i64,
+            (BigInt::from(1i64) << 128u32) - 1i64,
+            (BigInt::from(1i64) << 130u32) + 7i64,
+            -((BigInt::from(1i64) << 64u32) + 3i64),
+        ];
+        let divisors_i64 = [2i64, 3, 7, 1_000_000_007, i64::MAX, -2, -7, i64::MIN];
+
+        for a in &dividends {
+            let va = Value::from_bigint(a.clone());
+            for &d in &divisors_i64 {
+                let got = eval_idiv(&va, &Value::Int(d)).unwrap();
+                let expected = Value::from_bigint(a.div_floor(&BigInt::from(d)));
+                assert_eq!(got, expected, "idiv mismatch for {a} // {d}");
+            }
+            for b in &divisors_big {
+                let vb = Value::from_bigint(b.clone());
+                let got = eval_idiv(&va, &vb).unwrap();
+                let expected = Value::from_bigint(a.div_floor(b));
+                assert_eq!(got, expected, "idiv mismatch for {a} // {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_in_place_bigint_aliasing_sharing_and_demotion() {
+        let two_63 = BigInt::from(1i64) << 63u32; // i64::MAX + 1
+        let two_100 = BigInt::from(1i64) << 100u32;
+        let neg_min_minus_1 = BigInt::from(i64::MIN) - 1i64;
+
+        // 1. Unique owner dst == a mutates in place; demotes cleanly to i64::MAX / i64::MIN.
+        let mut stack = vec![Value::from_bigint(two_63.clone()), Value::Int(-1)];
+        eval_add_into(&mut stack, 0, 0, 1).unwrap();
+        assert_eq!(stack[0], Value::Int(i64::MAX));
+
+        let mut stack = vec![Value::from_bigint(neg_min_minus_1.clone()), Value::Int(1)];
+        eval_add_into(&mut stack, 0, 0, 1).unwrap();
+        assert_eq!(stack[0], Value::Int(i64::MIN));
+
+        // Unary negation in place: -(2^63) demotes cleanly to i64::MIN.
+        let mut stack = vec![Value::from_bigint(two_63.clone())];
+        eval_unm_into(&mut stack, 0, 0).unwrap();
+        assert_eq!(stack[0], Value::Int(i64::MIN));
+
+        // 2. Shared alias (strong_count >= 2) MUST NOT be mutated!
+        let shared_rc = Rc::new(two_100.clone());
+        let mut stack = vec![Value::BigInt(Rc::clone(&shared_rc)), Value::Int(42)];
+        eval_add_into(&mut stack, 0, 0, 1).unwrap();
+        assert_eq!(stack[0], Value::from_bigint(&two_100 + 42i64));
+        assert_eq!(*shared_rc, two_100);
+
+        stack[0] = Value::BigInt(Rc::clone(&shared_rc));
+        eval_sub_into(&mut stack, 0, 0, 1).unwrap();
+        assert_eq!(stack[0], Value::from_bigint(&two_100 - 42i64));
+        assert_eq!(*shared_rc, two_100);
+
+        stack[0] = Value::BigInt(Rc::clone(&shared_rc));
+        eval_shr_bigint_into(&mut stack, 0, 0, 10);
+        assert_eq!(stack[0], Value::from_bigint(&two_100 >> 10u32));
+        assert_eq!(*shared_rc, two_100);
+
+        stack[0] = Value::BigInt(Rc::clone(&shared_rc));
+        eval_shl_bigint_into(&mut stack, 0, 0, 5).unwrap();
+        assert_eq!(stack[0], Value::from_bigint(&two_100 << 5u32));
+        assert_eq!(*shared_rc, two_100);
+
+        stack[0] = Value::BigInt(Rc::clone(&shared_rc));
+        eval_bitor_into(&mut stack, 0, 0, 1).unwrap();
+        assert_eq!(stack[0], Value::from_bigint(&two_100 | BigInt::from(42i64)));
+        assert_eq!(*shared_rc, two_100);
+
+        // 3. Unique-owner dst == a reuses the exact Rc allocation (ptr_eq).
+        let unique_rc = Rc::new(two_100.clone());
+        let orig_ptr = Rc::as_ptr(&unique_rc);
+        let mut stack = vec![Value::BigInt(unique_rc), Value::Int(7)];
+        eval_add_into(&mut stack, 0, 0, 1).unwrap();
+        let Value::BigInt(ref after_add) = stack[0] else {
+            panic!("expected BigInt");
+        };
+        assert_eq!(Rc::as_ptr(after_add), orig_ptr);
+        assert_eq!(**after_add, &two_100 + 7i64);
+
+        eval_bitor_into(&mut stack, 0, 0, 1).unwrap();
+        eval_bitxor_into(&mut stack, 0, 0, 1).unwrap();
+        eval_shl_bigint_into(&mut stack, 0, 0, 4).unwrap();
+        eval_shr_bigint_into(&mut stack, 0, 0, 4);
+        let Value::BigInt(ref after_ops) = stack[0] else {
+            panic!("expected BigInt");
+        };
+        assert_eq!(Rc::as_ptr(after_ops), orig_ptr);
+
+        // 4. dst == b (commutative add) and dst == a == b (doubling / self-sub).
+        let mut stack = vec![Value::Int(7), Value::from_bigint(two_100.clone())];
+        eval_add_into(&mut stack, 1, 0, 1).unwrap();
+        assert_eq!(stack[1], Value::from_bigint(&two_100 + 7i64));
+
+        let mut stack = vec![Value::from_bigint(two_100.clone())];
+        eval_add_into(&mut stack, 0, 0, 0).unwrap();
+        assert_eq!(stack[0], Value::from_bigint(&two_100 << 1u32));
+
+        let mut stack = vec![Value::from_bigint(two_100.clone())];
+        eval_sub_into(&mut stack, 0, 0, 0).unwrap();
+        assert_eq!(stack[0], Value::Int(0));
+
+        // 5. Bitwise AND demotion back to Int when masked to small positive int.
+        let mut stack = vec![
+            Value::from_bigint(&two_100 | BigInt::from(0xffi64)),
+            Value::Int(0x0f),
+        ];
+        eval_bitand_into(&mut stack, 0, 0, 1).unwrap();
+        assert_eq!(stack[0], Value::Int(0x0f));
+
+        // 6. MAX_INT_BITS overflow check happens BEFORE mutation.
+        let huge = BigInt::from(1i64) << (MAX_INT_BITS as usize);
+        let mut stack = vec![Value::from_bigint(huge.clone()), Value::Int(1)];
+        assert!(eval_add_into(&mut stack, 0, 0, 1).is_err());
+        assert_eq!(stack[0], Value::from_bigint(huge.clone()));
+        assert!(eval_shl_bigint_into(&mut stack, 0, 0, 1).is_err());
+        assert_eq!(stack[0], Value::from_bigint(huge));
     }
 }

@@ -419,6 +419,15 @@ impl Value {
     }
 
     #[inline]
+    pub fn from_u128(i: u128) -> Value {
+        if let Ok(small) = i64::try_from(i) {
+            Value::Int(small)
+        } else {
+            Value::BigInt(Rc::new(BigInt::from(i)))
+        }
+    }
+
+    #[inline]
     pub fn from_usize(i: usize) -> Value {
         match i64::try_from(i) {
             Ok(small) => Value::Int(small),
