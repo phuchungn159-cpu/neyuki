@@ -3,10 +3,14 @@
 
 use num_bigint::BigInt;
 use num_traits::{FromPrimitive, ToPrimitive};
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::str::FromStr;
 
+use crate::bytecode::Proto;
+use crate::vm::hash::FxHashMap;
 use crate::vm::machine::VM;
-use crate::vm::value::Value;
+use crate::vm::value::{StrRef, Value};
 
 pub fn builtin_print(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     use std::io::Write;
@@ -42,14 +46,28 @@ pub fn builtin_assert(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String
     Ok(vec![cond])
 }
 
+/// Interns static type names (`"nil"`, `"number"`, `"bigint"`, ...) once per
+/// thread so `type(v)` and `typeof(v)` return a refcount bump instead of
+/// allocating and hashing a fresh `String` on every call.
+fn static_type_str(name: &'static str) -> Value {
+    thread_local! {
+        static CACHE: RefCell<FxHashMap<&'static str, StrRef>> = RefCell::new(FxHashMap::default());
+    }
+    CACHE.with(|cache| {
+        let mut map = cache.borrow_mut();
+        let s = map.entry(name).or_insert_with(|| StrRef::from(name));
+        Value::String(s.clone())
+    })
+}
+
 pub fn builtin_type(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let val = args.first().unwrap_or(&Value::Nil);
-    Ok(vec![Value::String((val.type_name().to_string()).into())])
+    Ok(vec![static_type_str(val.type_name())])
 }
 
 pub fn builtin_typeof(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
     let val = args.first().unwrap_or(&Value::Nil);
-    Ok(vec![Value::String((val.typeof_name().to_string()).into())])
+    Ok(vec![static_type_str(val.typeof_name())])
 }
 
 pub fn builtin_checktype(_vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String> {
@@ -303,22 +321,44 @@ pub fn builtin_xpcall(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String>
 }
 
 /// Resolves a standard or bundled `@neyuki/...` module (the prefix is
-/// optional), or returns `None` when `name` is neither. Bundled sources run
-/// once; every later `require` gets the same table.
+/// optional), or returns `None` when `name` is neither. Bundled sources are
+/// compiled and verified once per thread as an immutable template; each VM
+/// clones an isolated prototype tree with fresh `GetImport` caches so dropped
+/// VMs never leak tables and alternating VMs never thrash each other's caches.
 fn load_bundled_module(vm: &mut VM, name: &str) -> Result<Option<Value>, String> {
     let bare = name.strip_prefix("@neyuki/").unwrap_or(name);
     if let Some(cached) = vm.modules.get(bare).cloned() {
         return Ok(Some(cached));
     }
-    let Some((_, source)) = crate::vm::libs::BUNDLED_LIBRARIES
+    let Some(&(bundled_name, source)) = crate::vm::libs::BUNDLED_LIBRARIES
         .iter()
         .find(|(bundled, _)| bundled.strip_prefix("@neyuki/") == Some(bare))
     else {
         return Ok(None);
     };
-    let proto = crate::compiler::compile_program(source, name, crate::compiler::Options::UNCHECKED)
+    thread_local! {
+        static BUNDLED_PROTOS: RefCell<FxHashMap<&'static str, Proto>> =
+            RefCell::new(FxHashMap::default());
+    }
+    let proto = BUNDLED_PROTOS.with(|cache| -> Result<Rc<Proto>, String> {
+        let mut map = cache.borrow_mut();
+        if let Some(template) = map.get(bundled_name) {
+            return Ok(template.clone_isolated());
+        }
+        let compiled = crate::compiler::compile_program(
+            source,
+            bundled_name,
+            crate::compiler::Options::UNCHECKED,
+        )
         .map_err(|err| format!("error in module '{}': {}", name, err))?;
-    let value = vm.execute_module(proto)?;
+        crate::bytecode::verify_proto(&compiled).map_err(|e| e.to_string())?;
+        compiled.mark_verified();
+        compiled.warm_values();
+        let isolated = compiled.clone_isolated();
+        map.insert(bundled_name, compiled);
+        Ok(isolated)
+    })?;
+    let value = vm.execute_module_rc(proto)?;
     vm.modules.insert(bare.to_string(), value.clone());
     Ok(Some(value))
 }
@@ -383,7 +423,7 @@ pub fn builtin_require(vm: &mut VM, args: &[Value]) -> Result<Vec<Value>, String
     vm.modules.insert(key.clone(), pending);
     // Run on top of the current frames: `execute` would reset the
     // stack out from under whatever called `require`.
-    match vm.execute_module((*proto).clone()) {
+    match vm.execute_module_rc(proto) {
         Ok(val) => {
             vm.modules.insert(key, val.clone());
             Ok(vec![val])
@@ -431,5 +471,169 @@ mod tests {
         let err =
             builtin_asserttype(&mut vm, &[Value::str("hello"), Value::str("int")]).unwrap_err();
         assert!(err.contains("type assertion failed"));
+    }
+
+    #[test]
+    fn test_bundled_cache_does_not_leak_vm_tables_on_drop() {
+        // 1. Acyclic bundled module (`@neyuki/crypto`): dropping the VM alone
+        // must immediately release both the module table and stdlib tables.
+        let crypto_proto = crate::compiler::compile_program(
+            r#"
+                local crypto = require("@neyuki/crypto")
+                return crypto.hash("abc", "sha256")
+            "#,
+            "leak_crypto",
+            crate::compiler::Options::RUN,
+        )
+        .expect("compile");
+        let (weak_crypto_table, weak_crypto_mod) = {
+            let mut vm = VM::new();
+            let weak_table = match vm.globals.get("table") {
+                Some(Value::Table(t)) => Rc::downgrade(t),
+                _ => panic!("missing table global"),
+            };
+            let _ = vm.execute(crypto_proto).expect("exec");
+            let weak_mod = match vm.modules.get("crypto") {
+                Some(Value::Table(t)) => Rc::downgrade(t),
+                _ => panic!("missing crypto module"),
+            };
+            (weak_table, weak_mod)
+        };
+        assert!(weak_crypto_table.upgrade().is_none());
+        assert!(weak_crypto_mod.upgrade().is_none());
+
+        // 2. Bundled module executing `GetImport` against frozen global `debug`
+        // (`@neyuki/profile` caches `debug.sethook` / `debug.getinfo` in its
+        // `ProtoCache::imports`). Once the VM and module's own closure cycle
+        // are dropped, the thread-local `BUNDLED_PROTOS` cache must not retain
+        // the dropped VM's `debug` table.
+        let profile_proto = crate::compiler::compile_program(
+            r#"
+                local profile = require("@neyuki/profile")
+                local function work(n)
+                    if n <= 0 then return 0 end
+                    return work(n - 1)
+                end
+                profile.start()
+                work(2)
+                return profile.stop()
+            "#,
+            "leak_profile",
+            crate::compiler::Options::RUN,
+        )
+        .expect("compile");
+        let weak_debug = {
+            let mut vm = VM::new();
+            let weak_debug = match vm.globals.get("debug") {
+                Some(Value::Table(t)) => Rc::downgrade(t),
+                _ => panic!("missing debug global"),
+            };
+            let out = vm.execute(profile_proto).expect("exec");
+            assert!(out.to_string().contains("work"));
+            // Break `profile`'s internal table<->closure cycle (`tracer`
+            // captures `profile`); any remaining strong ref to `debug` would
+            // come from a leaked `ImportSlot` in `BUNDLED_PROTOS`.
+            if let Some(Value::Table(profile_tbl)) = vm.modules.get("profile") {
+                profile_tbl.borrow_mut().fields.clear();
+            }
+            weak_debug
+        };
+        assert!(
+            weak_debug.upgrade().is_none(),
+            "bundled proto cache retained dropped VM's `debug` table"
+        );
+    }
+
+    #[test]
+    fn test_bundled_cache_isolates_getimport_and_prevents_thrashing() {
+        // Each VM replaces global `debug` with its own frozen table so
+        // `GetImport` inside `@neyuki/profile` caches `debug.sethook` per VM.
+        // Alternating calls across VMs must hit each VM's own cached hook
+        // without leaking across VMs or overwriting the other VM's slots.
+        let setup = |delta: i64| {
+            let code = format!(
+                r#"
+                local hits = 0
+                debug = table.freeze({{
+                    sethook = function() hits += {delta} end,
+                    getinfo = function() return nil end,
+                }})
+                local profile = require("@neyuki/profile")
+                return function()
+                    profile.start()
+                    profile.stop()
+                    return hits
+                end
+            "#
+            );
+            let proto =
+                crate::compiler::compile_program(&code, "iso", crate::compiler::Options::RUN)
+                    .expect("compile");
+            let mut vm = VM::new();
+            let runner = vm.execute(proto).expect("exec");
+            (vm, runner)
+        };
+
+        let (mut vm1, run1) = setup(1);
+        let (mut vm2, run2) = setup(10);
+        assert_eq!(
+            vm1.call_function(run1.clone(), &[]).unwrap(),
+            vec![Value::Int(2)]
+        );
+        assert_eq!(
+            vm2.call_function(run2.clone(), &[]).unwrap(),
+            vec![Value::Int(20)]
+        );
+        assert_eq!(
+            vm1.call_function(run1.clone(), &[]).unwrap(),
+            vec![Value::Int(4)]
+        );
+        assert_eq!(vm2.call_function(run2, &[]).unwrap(), vec![Value::Int(40)]);
+        assert_eq!(vm1.call_function(run1, &[]).unwrap(), vec![Value::Int(6)]);
+
+        // Verify the two VMs' `profile.start` closures own distinct `Proto`s
+        // (and thus unshared `ImportSlot` vectors).
+        let proto_ptr = |vm: &VM| -> *const Proto {
+            let Value::Table(t) = vm.modules.get("profile").expect("profile module") else {
+                panic!("profile not a table");
+            };
+            let Value::Closure(c) = t.borrow().fields.get("start").expect("start fn").clone()
+            else {
+                panic!("start not a closure");
+            };
+            Rc::as_ptr(&c.proto)
+        };
+        assert_ne!(proto_ptr(&vm1), proto_ptr(&vm2));
+    }
+
+    #[test]
+    fn test_vm_templates_and_bundled_cache_are_isolated_across_vms() {
+        let code = r#"
+            local crypto = require("@neyuki/crypto")
+            setmetatable(math, { __index = function() return 99 end })
+            return crypto.hash("abc", "sha256")
+        "#;
+        let proto = crate::compiler::compile_program(code, "test", crate::compiler::Options::RUN)
+            .expect("compile");
+
+        let mut vm1 = VM::new();
+        let h1 = vm1.execute(proto).expect("vm1 exec");
+
+        let check_code = r#"
+            local crypto = require("@neyuki/crypto")
+            assert(getmetatable(math) == nil, "metatable leaked across VMs")
+            return crypto.hash("abc", "sha256")
+        "#;
+        let check_proto =
+            crate::compiler::compile_program(check_code, "test2", crate::compiler::Options::RUN)
+                .expect("compile2");
+        let mut vm2 = VM::new();
+        let h2 = vm2.execute(check_proto).expect("vm2 exec");
+
+        assert_eq!(h1, h2);
+        assert_eq!(
+            h1.to_string(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 }

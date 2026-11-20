@@ -159,6 +159,44 @@ impl Proto {
         })
     }
 
+    /// Pre-populates the materialized constant values across this prototype tree.
+    pub fn warm_values(&self) {
+        let _ = self.values();
+        for child in &self.protos {
+            child.warm_values();
+        }
+    }
+
+    /// Clones this prototype tree with fresh, empty `GetImport` caches while
+    /// preserving verification status and already-materialized constant values
+    /// (which contain only immutable primitives and strings, never VM tables).
+    ///
+    /// Used when instantiating a cached bundled module into a VM so each VM
+    /// owns its own import slots: dropping a VM releases all of its tables and
+    /// concurrent VMs on the same thread never thrash each other's caches.
+    pub fn clone_isolated(&self) -> Rc<Proto> {
+        let cache = ProtoCache {
+            values: self.cache.values.clone(),
+            verified: Cell::new(self.cache.verified.get()),
+            imports: RefCell::new(Vec::new()),
+        };
+        Rc::new(Proto {
+            name: self.name.clone(),
+            num_params: self.num_params,
+            max_registers: self.max_registers,
+            is_vararg: self.is_vararg,
+            constants: self.constants.clone(),
+            instructions: self.instructions.clone(),
+            protos: self.protos.iter().map(|p| p.clone_isolated()).collect(),
+            upvalues: self.upvalues.clone(),
+            lines: self.lines.clone(),
+            local_names: self.local_names.clone(),
+            source: self.source.clone(),
+            upvalue_names: self.upvalue_names.clone(),
+            cache,
+        })
+    }
+
     /// Cached `module.field` value for a `GetImport` site, if the slot was
     /// resolved under the current globals epoch and the module table still
     /// has no metatable (so no `__index`/`__mode` game can have intervened).
