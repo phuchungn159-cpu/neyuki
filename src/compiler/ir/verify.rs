@@ -1,86 +1,83 @@
 //! Structural checks on IR: jump targets, edges and variable definitions.
 
-use std::collections::HashSet;
-
 use crate::compiler::ir::block::{ControlFlowGraph, IrFunction, IrModule};
 use crate::compiler::ir::inst::IrInst;
-use crate::compiler::ir::types::{IrLabel, IrVar};
+use crate::compiler::ir::types::IrLabel;
+use crate::vm::hash::{FxHashMap, with_capacity};
 
 #[derive(Debug, Clone)]
 pub struct VerifyError {
     pub message: String,
 }
 
-pub fn verify_cfg(cfg: &ControlFlowGraph, num_params: u8) -> Result<(), Vec<String>> {
+pub fn verify_cfg(cfg: &ControlFlowGraph) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
 
-    // 1. Verify entry block exists
-    if cfg.find_block(cfg.entry_label).is_none() {
+    // 1. Index all blocks by label and verify uniqueness
+    let mut label_to_idx: FxHashMap<IrLabel, usize> = with_capacity(cfg.blocks.len());
+    for (idx, block) in cfg.blocks.iter().enumerate() {
+        if label_to_idx.insert(block.label, idx).is_some() {
+            errors.push(format!("duplicate block label {:?}", block.label));
+        }
+    }
+
+    // 2. Verify entry block exists
+    if !label_to_idx.contains_key(&cfg.entry_label) {
         errors.push(format!(
             "entry block {:?} not found in CFG",
             cfg.entry_label
         ));
     }
 
-    // 2. Verify all block labels are unique
-    let mut seen_labels = HashSet::new();
-    for block in &cfg.blocks {
-        if !seen_labels.insert(block.label) {
-            errors.push(format!("duplicate block label {:?}", block.label));
-        }
-    }
-
     // 3. Verify jump targets, successors, predecessors, and edge reciprocity
-    let label_set: HashSet<IrLabel> = cfg.blocks.iter().map(|b| b.label).collect();
-
     for block in &cfg.blocks {
         let b_lbl = block.label;
 
         // Check jump targets
         for inst in &block.instructions {
-            for target in inst.jump_targets() {
-                if !label_set.contains(&target) {
-                    errors.push(format!(
-                        "block {:?} references unknown jump target {:?}",
-                        b_lbl, target
-                    ));
-                }
+            if let Some(target) = inst.jump_target()
+                && !label_to_idx.contains_key(&target)
+            {
+                errors.push(format!(
+                    "block {:?} references unknown jump target {:?}",
+                    b_lbl, target
+                ));
             }
         }
 
         // Check successors exist
         for &succ in &block.successors {
-            if !label_set.contains(&succ) {
+            let Some(&succ_idx) = label_to_idx.get(&succ) else {
                 errors.push(format!(
                     "block {:?} has unknown successor {:?}",
                     b_lbl, succ
                 ));
-            } else if let Some(succ_blk) = cfg.find_block(succ) {
-                // Edge reciprocity: succ must have b_lbl in predecessors
-                if !succ_blk.predecessors.contains(&b_lbl) {
-                    errors.push(format!(
-                        "broken edge reciprocity: {:?} -> {:?}, but {:?} not in {:?}'s predecessors",
-                        b_lbl, succ, b_lbl, succ
-                    ));
-                }
+                continue;
+            };
+            // Edge reciprocity: succ must have b_lbl in predecessors
+            if !cfg.blocks[succ_idx].predecessors.contains(&b_lbl) {
+                errors.push(format!(
+                    "broken edge reciprocity: {:?} -> {:?}, but {:?} not in {:?}'s predecessors",
+                    b_lbl, succ, b_lbl, succ
+                ));
             }
         }
 
         // Check predecessors exist
         for &pred in &block.predecessors {
-            if !label_set.contains(&pred) {
+            let Some(&pred_idx) = label_to_idx.get(&pred) else {
                 errors.push(format!(
                     "block {:?} has unknown predecessor {:?}",
                     b_lbl, pred
                 ));
-            } else if let Some(pred_blk) = cfg.find_block(pred) {
-                // Edge reciprocity: pred must have b_lbl in successors
-                if !pred_blk.successors.contains(&b_lbl) {
-                    errors.push(format!(
-                        "broken edge reciprocity: {:?} in {:?}'s predecessors, but {:?} not in {:?}'s successors",
-                        pred, b_lbl, b_lbl, pred
-                    ));
-                }
+                continue;
+            };
+            // Edge reciprocity: pred must have b_lbl in successors
+            if !cfg.blocks[pred_idx].successors.contains(&b_lbl) {
+                errors.push(format!(
+                    "broken edge reciprocity: {:?} in {:?}'s predecessors, but {:?} not in {:?}'s successors",
+                    pred, b_lbl, b_lbl, pred
+                ));
             }
         }
 
@@ -121,12 +118,6 @@ pub fn verify_cfg(cfg: &ControlFlowGraph, num_params: u8) -> Result<(), Vec<Stri
         }
     }
 
-    // 4. Parameter sanity check
-    let mut defined_vars = HashSet::new();
-    for i in 0..num_params {
-        defined_vars.insert(IrVar(i as u32));
-    }
-
     if errors.is_empty() {
         Ok(())
     } else {
@@ -138,7 +129,7 @@ pub fn verify_function(func: &IrFunction) -> Result<(), Vec<String>> {
     let mut all_errors = Vec::new();
 
     if let Some(cfg) = &func.cfg {
-        let res = verify_cfg(cfg, func.num_params);
+        let res = verify_cfg(cfg);
         if let Err(errs) = res {
             all_errors.extend(errs);
         }

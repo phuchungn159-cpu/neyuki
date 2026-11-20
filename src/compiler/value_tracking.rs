@@ -2,12 +2,13 @@
 
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 
 use crate::compiler::ir::block::ControlFlowGraph;
 use crate::compiler::ir::inst::IrInst;
 use crate::compiler::ir::types::{IrBinaryOp, IrConstant, IrLabel, IrUnaryOp, IrVar};
 use crate::sema::types::NeyukiType;
+use crate::vm::hash::{FxHashMap, new_map, new_set};
 
 /// The value lattice for dataflow analysis and abstract interpretation.
 #[derive(Clone, Debug, PartialEq)]
@@ -373,8 +374,8 @@ fn fold_const_unop(op: IrUnaryOp, src: &IrConstant) -> Option<IrConstant> {
 
 /// Abstract state tracking variables throughout basic blocks.
 pub struct ValueTracker {
-    pub block_in: HashMap<IrLabel, HashMap<IrVar, TrackedValue>>,
-    pub block_out: HashMap<IrLabel, HashMap<IrVar, TrackedValue>>,
+    pub block_in: FxHashMap<IrLabel, FxHashMap<IrVar, TrackedValue>>,
+    pub block_out: FxHashMap<IrLabel, FxHashMap<IrVar, TrackedValue>>,
 }
 
 impl Default for ValueTracker {
@@ -386,15 +387,15 @@ impl Default for ValueTracker {
 impl ValueTracker {
     pub fn new() -> Self {
         Self {
-            block_in: HashMap::new(),
-            block_out: HashMap::new(),
+            block_in: new_map(),
+            block_out: new_map(),
         }
     }
 
     /// Runs fixed-point dataflow analysis over the ControlFlowGraph.
     pub fn analyze(&mut self, cfg: &ControlFlowGraph) {
         let mut worklist = VecDeque::new();
-        let mut in_worklist = HashSet::new();
+        let mut in_worklist = new_set();
 
         if let Some(entry) = cfg.entry_block() {
             worklist.push_back(entry.label);
@@ -409,7 +410,7 @@ impl ValueTracker {
             };
 
             // Compute block_in from all predecessors
-            let mut state: HashMap<IrVar, TrackedValue> = HashMap::new();
+            let mut state: FxHashMap<IrVar, TrackedValue> = new_map();
             let mut first = true;
             for pred_label in &block.predecessors {
                 if let Some(pred_out) = self.block_out.get(pred_label) {
@@ -502,7 +503,7 @@ pub fn value_tracking_cfg(cfg: &mut ControlFlowGraph) -> bool {
     let mut changed = false;
 
     for block in &mut cfg.blocks {
-        let mut state: HashMap<IrVar, TrackedValue> = HashMap::new();
+        let mut state: FxHashMap<IrVar, TrackedValue> = new_map();
         let mut optimized_instructions = Vec::with_capacity(block.instructions.len());
 
         for inst in block.instructions.drain(..) {
@@ -575,16 +576,18 @@ pub fn value_tracking_cfg(cfg: &mut ControlFlowGraph) -> bool {
                 }
                 IrInst::Call { .. } | IrInst::Spread { .. } => {
                     // Function calls may execute closures and mutate captured variables.
-                    state.retain(|var, _| !captured.contains(var));
-                    for d in inst.def_vars() {
-                        state.remove(&d);
+                    if !captured.is_empty() {
+                        state.retain(|var, _| !captured.contains(var));
                     }
+                    inst.for_each_def(|d| {
+                        state.remove(&d);
+                    });
                     optimized_instructions.push(inst);
                 }
                 other => {
-                    for d in other.def_vars() {
+                    other.for_each_def(|d| {
                         state.remove(&d);
-                    }
+                    });
                     optimized_instructions.push(other);
                 }
             }

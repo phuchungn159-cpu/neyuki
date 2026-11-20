@@ -1,7 +1,5 @@
 //! Emits bytecode from IR: register assignment and jump patching.
 
-use std::collections::HashMap;
-
 use crate::bytecode::instruction::Instruction;
 use crate::bytecode::instruction::MULTRET;
 use crate::bytecode::proto::{Constant, Proto};
@@ -10,9 +8,10 @@ use crate::compiler::ir::cfg_builder::build_cfg;
 use crate::compiler::ir::inst::{IrInst, SpreadSink, SpreadSource};
 use crate::compiler::ir::regalloc::allocate_registers;
 use crate::compiler::ir::types::{IrBinaryOp, IrConstant, IrLabel, IrUnaryOp, IrVar};
+use crate::vm::hash::{FxHashMap, FxHashSet, new_map, new_set, with_capacity};
 
 struct RegAlloc {
-    var_to_reg: HashMap<IrVar, u8>,
+    var_to_reg: FxHashMap<IrVar, u8>,
     next_reg: u8,
     /// Set once the 255-register limit is hit, so lowering reports it instead
     /// of handing out a register that is already in use.
@@ -21,7 +20,7 @@ struct RegAlloc {
 
 impl RegAlloc {
     fn new(num_params: u8) -> Self {
-        let mut var_to_reg = HashMap::new();
+        let mut var_to_reg = with_capacity(num_params as usize);
         for i in 0..num_params {
             var_to_reg.insert(IrVar(i as u32), i);
         }
@@ -195,7 +194,15 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
     proto.upvalues = func.upvalues.clone();
     proto.upvalue_names = func.upvalue_names.clone();
 
-    let allocation = allocate_registers(&build_cfg(&func.instructions), func.num_params);
+    let built_cfg;
+    let cfg = match &func.cfg {
+        Some(cfg) if cfg.matches_flat_instructions(&func.instructions) => cfg,
+        _ => {
+            built_cfg = build_cfg(&func.instructions);
+            &built_cfg
+        }
+    };
+    let allocation = allocate_registers(cfg, func.num_params);
     let mut regs = match &allocation {
         Ok(alloc) => RegAlloc::from_allocation(alloc),
         Err(_) => RegAlloc::new(func.num_params),
@@ -215,9 +222,12 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
     // reserved next, because a call places the callee's frame directly above
     // the callee's register and would overwrite anything higher up.
     for inst in &func.instructions {
-        for var in inst.use_vars().into_iter().chain(inst.def_vars()) {
+        inst.for_each_use(|var| {
             regs.get(var, &mut proto);
-        }
+        });
+        inst.for_each_def(|var| {
+            regs.get(var, &mut proto);
+        });
     }
 
     for inst in &func.instructions {
@@ -286,31 +296,27 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
         ));
     }
 
-    let mut capture_regs: HashMap<u16, Vec<Option<u8>>> = HashMap::new();
-    let mut label_positions: HashMap<IrLabel, usize> = HashMap::new();
+    let mut capture_regs: FxHashMap<u16, Vec<Option<u8>>> = new_map();
+    let mut label_positions: FxHashMap<IrLabel, usize> = new_map();
     let mut jump_patches: Vec<(usize, IrLabel)> = Vec::new();
     // Next `GetImport` cache site in this function (dense per-proto).
     let mut import_sites: u16 = 0;
 
     // How often each variable is read. A temporary read exactly once, by the
     // very next instruction, can be folded into that instruction.
-    let mut use_count: HashMap<IrVar, usize> = HashMap::new();
-    for inst in &func.instructions {
-        for var in inst.use_vars() {
-            *use_count.entry(var).or_insert(0) += 1;
-        }
-    }
-    let single_use = |var: IrVar| use_count.get(&var).copied().unwrap_or(0) == 1;
-
+    let mut use_count: FxHashMap<IrVar, usize> = new_map();
     // Table keys that are always one constant string are read straight from
     // the constant pool (`GetTableK`/`SetTableK`). When a key is used for
     // nothing else, its `LoadK` is not emitted at all.
-    let mut def_count: HashMap<IrVar, usize> = HashMap::new();
-    let mut const_keys: HashMap<IrVar, &str> = HashMap::new();
+    let mut def_count: FxHashMap<IrVar, usize> = new_map();
+    let mut const_keys: FxHashMap<IrVar, &str> = new_map();
     for inst in &func.instructions {
-        for var in inst.def_vars() {
+        inst.for_each_use(|var| {
+            *use_count.entry(var).or_insert(0) += 1;
+        });
+        inst.for_each_def(|var| {
             *def_count.entry(var).or_insert(0) += 1;
-        }
+        });
         if let IrInst::LoadConst {
             dst,
             val: IrConstant::String(s),
@@ -319,21 +325,25 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
             const_keys.insert(*dst, s.as_str());
         }
     }
+    let single_use = |var: IrVar| use_count.get(&var).copied().unwrap_or(0) == 1;
+
     const_keys.retain(|var, _| def_count.get(var) == Some(&1));
-    let mut key_uses: HashMap<IrVar, usize> = HashMap::new();
-    for inst in &func.instructions {
-        match inst {
-            IrInst::GetTable { table, key, .. } if table != key => {
-                *key_uses.entry(*key).or_insert(0) += 1;
+    let mut key_uses: FxHashMap<IrVar, usize> = new_map();
+    if !const_keys.is_empty() {
+        for inst in &func.instructions {
+            match inst {
+                IrInst::GetTable { table, key, .. } if table != key => {
+                    *key_uses.entry(*key).or_insert(0) += 1;
+                }
+                IrInst::SetTable { table, key, val } if table != key && val != key => {
+                    *key_uses.entry(*key).or_insert(0) += 1;
+                }
+                IrInst::DebugLocal { var, .. } => {
+                    key_uses.remove(var);
+                    const_keys.remove(var);
+                }
+                _ => {}
             }
-            IrInst::SetTable { table, key, val } if table != key && val != key => {
-                *key_uses.entry(*key).or_insert(0) += 1;
-            }
-            IrInst::DebugLocal { var, .. } => {
-                key_uses.remove(var);
-                const_keys.remove(var);
-            }
-            _ => {}
         }
     }
     let key_only = |var: &IrVar| {
@@ -401,7 +411,7 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
         }
     }
 
-    let mut skipped_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut skipped_indices: FxHashSet<usize> = new_set();
     let mut line = 1u32;
     // Locals whose scope is still open: their variable and debug-info entry.
     let mut open_locals: Vec<(IrVar, usize)> = Vec::new();
@@ -424,7 +434,7 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
             && v != t
             && inst.def_var() == Some(*t)
             && single_use(*t)
-            && !inst.use_vars().contains(v)
+            && !inst.uses_var(*v)
         {
             let rv = regs.get(*v, &mut proto);
             regs.bind(*t, rv, &mut proto);
@@ -1195,8 +1205,12 @@ fn ir_function_to_proto(func: &IrFunction, depth: usize) -> Result<Proto, String
             _ => continue,
         };
 
+        if !matches!(proto.instructions[current_target], Instruction::Jump { .. }) {
+            continue;
+        }
+
         let mut target = current_target;
-        let mut visited = std::collections::HashSet::new();
+        let mut visited = new_set();
         visited.insert(ip);
         while visited.insert(target) && target < num_insts {
             if let Instruction::Jump { offset } = proto.instructions[target] {

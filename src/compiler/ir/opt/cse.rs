@@ -1,10 +1,9 @@
 //! Common subexpression elimination for pure instructions.
 
-use std::collections::HashMap;
-
 use crate::compiler::ir::block::{ControlFlowGraph, IrModule};
 use crate::compiler::ir::inst::IrInst;
 use crate::compiler::ir::types::{IrBinaryOp, IrUnaryOp, IrVar};
+use crate::vm::hash::{FxHashMap, new_map};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum ExpressionKey {
@@ -69,7 +68,7 @@ fn has_side_effects(inst: &IrInst) -> bool {
 }
 
 fn cse_slice(instructions: &mut [IrInst]) -> bool {
-    let mut expr_map: HashMap<ExpressionKey, IrVar> = HashMap::new();
+    let mut expr_map: FxHashMap<ExpressionKey, IrVar> = new_map();
     let mut modified = false;
 
     for inst in instructions.iter_mut() {
@@ -116,15 +115,17 @@ fn cse_slice(instructions: &mut [IrInst]) -> bool {
         }
 
         // Any instruction that modifies a variable invalidates expressions using or defining it
-        for def in inst.def_vars() {
-            invalidate_expressions(&mut expr_map, def);
+        if !expr_map.is_empty() {
+            inst.for_each_def(|def| {
+                invalidate_expressions(&mut expr_map, def);
+            });
         }
     }
 
     modified
 }
 
-fn invalidate_expressions(map: &mut HashMap<ExpressionKey, IrVar>, modified_var: IrVar) {
+fn invalidate_expressions(map: &mut FxHashMap<ExpressionKey, IrVar>, modified_var: IrVar) {
     map.retain(|key, &mut target_var| {
         if target_var == modified_var {
             return false;

@@ -21,10 +21,62 @@ use crate::sema::types::NeyukiType;
 /// expansion is cut off, leaving `any`, instead of growing without bound.
 const ALIAS_EXPANSION_BUDGET: usize = 512;
 
+/// Built-in globals recognized by semantic analysis without per-compile heap
+/// allocations. Must stay strictly sorted for `binary_search`.
+const BUILTIN_GLOBALS: &[&str] = &[
+    "_G",
+    "_VERSION",
+    "assert",
+    "assert_type",
+    "asserttype",
+    "bit",
+    "bit32",
+    "buffer",
+    "checktype",
+    "collectgarbage",
+    "coroutine",
+    "debug",
+    "error",
+    "false",
+    "float",
+    "getmetatable",
+    "int",
+    "ipairs",
+    "json",
+    "math",
+    "next",
+    "nil",
+    "os",
+    "pairs",
+    "pcall",
+    "print",
+    "rawequal",
+    "rawget",
+    "rawlen",
+    "rawset",
+    "require",
+    "select",
+    "setmetatable",
+    "string",
+    "table",
+    "task",
+    "tonumber",
+    "tostring",
+    "true",
+    "try",
+    "type",
+    "typeof",
+    "utf8",
+    "warn",
+    "xpcall",
+];
+
 pub struct SemanticAnalyzer<'a> {
     pub source: &'a str,
     pub scope_mgr: ScopeManager,
     pub diagnostics: Vec<Diagnostic>,
+    /// User-declared `global` names discovered during analysis; built-in
+    /// globals live in `BUILTIN_GLOBALS`.
     pub known_globals: HashSet<String>,
     pub undeclared: HashSet<String>,
     current_return_type: Option<NeyukiType>,
@@ -34,63 +86,11 @@ pub struct SemanticAnalyzer<'a> {
 
 impl<'a> SemanticAnalyzer<'a> {
     pub fn new(source: &'a str) -> Self {
-        let mut known_globals = HashSet::new();
-        let globals = [
-            "print",
-            "assert",
-            "require",
-            "type",
-            "typeof",
-            "checktype",
-            "asserttype",
-            "assert_type",
-            "tostring",
-            "tonumber",
-            "int",
-            "float",
-            "pcall",
-            "xpcall",
-            "try",
-            "error",
-            "pairs",
-            "ipairs",
-            "next",
-            "select",
-            "rawget",
-            "rawset",
-            "rawequal",
-            "rawlen",
-            "setmetatable",
-            "getmetatable",
-            "collectgarbage",
-            "math",
-            "string",
-            "table",
-            "bit",
-            "bit32",
-            "buffer",
-            "os",
-            "coroutine",
-            "task",
-            "utf8",
-            "debug",
-            "json",
-            "true",
-            "false",
-            "nil",
-            "_G",
-            "_VERSION",
-            "warn",
-        ];
-        for g in globals {
-            known_globals.insert(g.to_string());
-        }
-
         Self {
             source,
             scope_mgr: ScopeManager::new(),
             diagnostics: Vec::new(),
-            known_globals,
+            known_globals: HashSet::new(),
             undeclared: HashSet::new(),
             current_return_type: None,
             current_line: 1,
@@ -141,7 +141,9 @@ impl<'a> SemanticAnalyzer<'a> {
     }
 
     fn is_known_global(&self, name: &str) -> bool {
-        self.known_globals.contains(name) || name.starts_with("__")
+        BUILTIN_GLOBALS.binary_search(&name).is_ok()
+            || self.known_globals.contains(name)
+            || name.starts_with("__")
     }
 
     pub fn analyze_program(&mut self, statements: &[Stmt]) {
@@ -1182,4 +1184,26 @@ fn required_params(params: &[Param], parse: impl Fn(&str) -> NeyukiType) -> usiz
             None => true,
         })
         .map_or(0, |i| i + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_builtin_globals_sorted_and_recognized() {
+        assert!(
+            BUILTIN_GLOBALS.windows(2).all(|w| w[0] < w[1]),
+            "BUILTIN_GLOBALS must be strictly sorted for binary_search"
+        );
+        let analyzer = SemanticAnalyzer::new("");
+        for &name in BUILTIN_GLOBALS {
+            assert!(
+                analyzer.is_known_global(name),
+                "expected builtin global '{name}' to be recognized"
+            );
+        }
+        assert!(analyzer.is_known_global("__custom_internal"));
+        assert!(!analyzer.is_known_global("definitely_not_a_global"));
+    }
 }

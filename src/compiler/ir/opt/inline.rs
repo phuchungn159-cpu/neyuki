@@ -11,11 +11,10 @@
 //   single-definition Move aliases, or through a single SetGlobal/GetGlobal
 //   pair for one name
 
-use std::collections::{HashMap, HashSet};
-
 use crate::compiler::ir::block::{IrFunction, IrModule, UpvalSource};
 use crate::compiler::ir::inst::IrInst;
 use crate::compiler::ir::types::{IrLabel, IrVar};
+use crate::vm::hash::{FxHashMap, FxHashSet, new_map, new_set};
 
 const MAX_INLINE_INSTRUCTIONS: usize = 32;
 
@@ -43,7 +42,7 @@ fn is_inlinable_body_inst(inst: &IrInst) -> bool {
     )
 }
 
-fn build_candidates(func: &IrFunction) -> HashMap<usize, IrFunction> {
+fn build_candidates(func: &IrFunction) -> FxHashMap<usize, IrFunction> {
     func.protos
         .iter()
         .enumerate()
@@ -90,15 +89,24 @@ pub fn inline_functions(module: &mut IrModule) -> bool {
     any_changed
 }
 
-fn inline_in_func(func: &mut IrFunction, candidates: &HashMap<usize, IrFunction>) -> bool {
-    let mut def_count: HashMap<IrVar, usize> = HashMap::new();
-    let mut move_alias: HashMap<IrVar, IrVar> = HashMap::new();
-    let mut closure_map: HashMap<IrVar, usize> = HashMap::new();
-    let mut getglobal_name: HashMap<IrVar, String> = HashMap::new();
-    let mut setglobal_srcs: HashMap<String, Vec<IrVar>> = HashMap::new();
+fn inline_in_func(func: &mut IrFunction, candidates: &FxHashMap<usize, IrFunction>) -> bool {
+    let mut def_count: FxHashMap<IrVar, usize> = new_map();
+    let mut move_alias: FxHashMap<IrVar, IrVar> = new_map();
+    let mut closure_map: FxHashMap<IrVar, usize> = new_map();
+    let mut getglobal_name: FxHashMap<IrVar, String> = new_map();
+    let mut setglobal_srcs: FxHashMap<String, Vec<IrVar>> = new_map();
+    let mut max_var_id = 0u32;
+    let mut max_label_id = 0usize;
     for inst in &func.instructions {
-        for d in inst.def_vars() {
+        inst.for_each_def(|d| {
             *def_count.entry(d).or_insert(0) += 1;
+            max_var_id = max_var_id.max(d.0);
+        });
+        inst.for_each_use(|u| {
+            max_var_id = max_var_id.max(u.0);
+        });
+        if let Some(l) = inst.jump_target() {
+            max_label_id = max_label_id.max(l.0);
         }
         match inst {
             IrInst::Closure { dst, proto_idx, .. } => {
@@ -113,24 +121,10 @@ fn inline_in_func(func: &mut IrFunction, candidates: &HashMap<usize, IrFunction>
             IrInst::SetGlobal { name, src } => {
                 setglobal_srcs.entry(name.clone()).or_default().push(*src);
             }
+            IrInst::Label(l) => {
+                max_label_id = max_label_id.max(l.0);
+            }
             _ => {}
-        }
-    }
-
-    let mut max_var_id = 0u32;
-    let mut max_label_id = 0usize;
-    for inst in &func.instructions {
-        if let Some(d) = inst.def_var() {
-            max_var_id = max_var_id.max(d.0);
-        }
-        for u in inst.use_vars() {
-            max_var_id = max_var_id.max(u.0);
-        }
-        for l in inst.jump_targets() {
-            max_label_id = max_label_id.max(l.0);
-        }
-        if let IrInst::Label(l) = inst {
-            max_label_id = max_label_id.max(l.0);
         }
     }
 
@@ -184,13 +178,13 @@ fn inline_in_func(func: &mut IrFunction, candidates: &HashMap<usize, IrFunction>
 /// against alias cycles. Returns the child proto index on success.
 fn resolve_callee(
     mut var: IrVar,
-    closure_map: &HashMap<IrVar, usize>,
-    move_alias: &HashMap<IrVar, IrVar>,
-    getglobal_name: &HashMap<IrVar, String>,
-    setglobal_srcs: &HashMap<String, Vec<IrVar>>,
-    def_count: &HashMap<IrVar, usize>,
+    closure_map: &FxHashMap<IrVar, usize>,
+    move_alias: &FxHashMap<IrVar, IrVar>,
+    getglobal_name: &FxHashMap<IrVar, String>,
+    setglobal_srcs: &FxHashMap<String, Vec<IrVar>>,
+    def_count: &FxHashMap<IrVar, usize>,
 ) -> Option<usize> {
-    let mut visited: HashSet<IrVar> = HashSet::new();
+    let mut visited: FxHashSet<IrVar> = new_set();
     loop {
         if let Some(&proto_idx) = closure_map.get(&var) {
             return Some(proto_idx);
@@ -235,7 +229,7 @@ fn splice_call(
     *max_label_id += 1;
     let exit_label = IrLabel(*max_label_id);
 
-    let mut label_map: HashMap<IrLabel, IrLabel> = HashMap::new();
+    let mut label_map: FxHashMap<IrLabel, IrLabel> = new_map();
     for inst in &target_func.instructions {
         if let IrInst::Label(l) = inst {
             *max_label_id += 1;
@@ -243,7 +237,7 @@ fn splice_call(
         }
     }
 
-    let mut var_map: HashMap<IrVar, IrVar> = HashMap::new();
+    let mut var_map: FxHashMap<IrVar, IrVar> = new_map();
     for (i, &arg) in call_args.iter().enumerate() {
         var_map.insert(IrVar(i as u32), arg);
     }
@@ -380,14 +374,14 @@ fn is_inline_candidate(func: &IrFunction) -> bool {
     }
 
     // Reject backward jumps (loops): linear splice cannot reconstruct loop SSA.
-    let mut label_indices = HashMap::new();
+    let mut label_indices: FxHashMap<IrLabel, usize> = new_map();
     for (idx, inst) in body.iter().enumerate() {
         if let IrInst::Label(l) = inst {
             label_indices.insert(*l, idx);
         }
     }
     for (idx, inst) in body.iter().enumerate() {
-        for target in inst.jump_targets() {
+        if let Some(target) = inst.jump_target() {
             if let Some(&target_idx) = label_indices.get(&target) {
                 if target_idx <= idx {
                     return false;
@@ -407,14 +401,14 @@ fn is_inline_candidate(func: &IrFunction) -> bool {
         )
     });
     if has_branches {
-        let mut def_counts = HashMap::new();
+        let mut def_counts: FxHashMap<IrVar, usize> = new_map();
         for i in 0..func.num_params {
             *def_counts.entry(IrVar(i as u32)).or_insert(0) += 1;
         }
         for inst in &body {
-            for d in inst.def_vars() {
+            inst.for_each_def(|d| {
                 *def_counts.entry(d).or_insert(0) += 1;
-            }
+            });
         }
         if def_counts.values().any(|&c| c > 1) {
             return false;
@@ -426,7 +420,7 @@ fn is_inline_candidate(func: &IrFunction) -> bool {
 
 /// Maps a use to its replacement; bails on uses that are neither parameters
 /// nor remapped definitions (the body would not be self-contained).
-fn use_mapped(v: &mut IrVar, var_map: &HashMap<IrVar, IrVar>) -> bool {
+fn use_mapped(v: &mut IrVar, var_map: &FxHashMap<IrVar, IrVar>) -> bool {
     match var_map.get(v).copied() {
         Some(mapped) => {
             *v = mapped;
@@ -438,7 +432,7 @@ fn use_mapped(v: &mut IrVar, var_map: &HashMap<IrVar, IrVar>) -> bool {
 
 /// Mints a fresh variable for a definition so spliced code cannot collide
 /// with caller variables.
-fn fresh_def(v: IrVar, var_map: &mut HashMap<IrVar, IrVar>, max_id: &mut u32) -> IrVar {
+fn fresh_def(v: IrVar, var_map: &mut FxHashMap<IrVar, IrVar>, max_id: &mut u32) -> IrVar {
     *max_id += 1;
     let fresh = IrVar(*max_id);
     var_map.insert(v, fresh);
@@ -447,7 +441,7 @@ fn fresh_def(v: IrVar, var_map: &mut HashMap<IrVar, IrVar>, max_id: &mut u32) ->
 
 fn remap_inline_vars(
     inst: &mut IrInst,
-    var_map: &mut HashMap<IrVar, IrVar>,
+    var_map: &mut FxHashMap<IrVar, IrVar>,
     max_id: &mut u32,
 ) -> bool {
     match inst {

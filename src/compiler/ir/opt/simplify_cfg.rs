@@ -1,13 +1,18 @@
 //! Control flow cleanup: drops unreachable blocks, merges straight-line
 //! blocks, skips empty jumps and resolves constant branches.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 
 use crate::compiler::ir::block::ControlFlowGraph;
 use crate::compiler::ir::inst::IrInst;
 use crate::compiler::ir::types::IrLabel;
+use crate::vm::hash::{FxHashMap, set_with_capacity, with_capacity};
 
 pub fn simplify_cfg(cfg: &mut ControlFlowGraph) -> bool {
+    if cfg.blocks.is_empty() || cfg.is_single_acyclic_block() {
+        return false;
+    }
+
     let mut changed = false;
     let mut iterations = 0;
     const MAX_PASSES: usize = 20;
@@ -28,15 +33,20 @@ pub fn simplify_cfg(cfg: &mut ControlFlowGraph) -> bool {
 
 // 1. Remove blocks that cannot be reached from CFG entry
 pub fn remove_unreachable_blocks(cfg: &mut ControlFlowGraph) -> bool {
-    let mut reachable = HashSet::new();
-    let mut queue = VecDeque::new();
+    let mut label_to_idx: FxHashMap<IrLabel, usize> = with_capacity(cfg.blocks.len());
+    for (idx, b) in cfg.blocks.iter().enumerate() {
+        label_to_idx.insert(b.label, idx);
+    }
+
+    let mut reachable = set_with_capacity(cfg.blocks.len());
+    let mut queue = VecDeque::with_capacity(cfg.blocks.len());
 
     reachable.insert(cfg.entry_label);
     queue.push_back(cfg.entry_label);
 
     while let Some(lbl) = queue.pop_front() {
-        if let Some(block) = cfg.find_block(lbl) {
-            for succ in &block.successors {
+        if let Some(&idx) = label_to_idx.get(&lbl) {
+            for succ in &cfg.blocks[idx].successors {
                 if reachable.insert(*succ) {
                     queue.push_back(*succ);
                 }

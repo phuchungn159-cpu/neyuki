@@ -18,7 +18,7 @@ pub use block::{BasicBlock, ControlFlowGraph, IrFunction, IrModule, UpvalSource}
 pub use builder::{IrBuilder, ast_to_ir, ast_to_ir_with};
 pub use cfg_builder::build_cfg;
 pub use codegen::ir_to_bytecode;
-pub use dom::DominatorTree;
+pub use dom::{DominatorTree, ImmediateDominators};
 pub use inst::{IrInst, SpreadSink, SpreadSource};
 pub use liveness::{LiveInterval, LivenessInfo};
 pub use opt::{
@@ -302,7 +302,7 @@ return #collected * 100 + total(table.unpack(collected))";
 
         construct_ssa(&mut cfg, &dom);
         destruct_ssa(&mut cfg);
-        let verify_result = verify_cfg(&cfg, 0);
+        let verify_result = verify_cfg(&cfg);
         assert!(
             verify_result.is_ok(),
             "CFG verification failed: {:?}",
@@ -375,7 +375,7 @@ return #collected * 100 + total(table.unpack(collected))";
         let mut cfg = build_cfg(&ir_module.main.instructions);
 
         optimize_cfg(&mut cfg);
-        let verify_result = verify_cfg(&cfg, 0);
+        let verify_result = verify_cfg(&cfg);
         assert!(verify_result.is_ok());
     }
 
@@ -405,7 +405,7 @@ return #collected * 100 + total(table.unpack(collected))";
         let mut cfg = build_cfg(&ir_module.main.instructions);
 
         optimize_cfg(&mut cfg);
-        let verify_result = verify_cfg(&cfg, 0);
+        let verify_result = verify_cfg(&cfg);
         assert!(
             verify_result.is_ok(),
             "CFG verification failed: {:?}",
@@ -668,5 +668,67 @@ return #collected * 100 + total(table.unpack(collected))";
             return y
         "#;
         assert_eq!(run_via_ir(code), "300");
+    }
+
+    #[test]
+    fn test_single_acyclic_block_rejects_self_loop_with_stale_edges() {
+        let mut cfg = ControlFlowGraph::new(IrLabel(0));
+        let mut blk = BasicBlock::new(IrLabel(0));
+        blk.add_instruction(IrInst::LoadConst {
+            dst: IrVar(1),
+            val: IrConstant::Int(BigInt::from(1)),
+        });
+        // Intentionally leave `successors` empty (stale) even though the block
+        // contains a self-loop jump.
+        blk.add_instruction(IrInst::Jump(IrLabel(0)));
+        cfg.blocks.push(blk);
+
+        assert!(
+            !cfg.is_single_acyclic_block(),
+            "a single block with a jump instruction must not pass is_single_acyclic_block"
+        );
+    }
+
+    #[test]
+    fn test_codegen_ignores_stale_cached_cfg_when_instructions_change() {
+        let code = "local a = 10\nlocal b = 20\nreturn a + b";
+        let stmts = compile_source(code).expect("syntax error");
+        let mut ir_module = ast_to_ir(&stmts);
+        let stale_cfg = build_cfg(&ir_module.main.instructions);
+        ir_module.main.cfg = Some(stale_cfg);
+
+        // Mutate `instructions` directly after storing `cfg`: codegen must
+        // notice the mismatch and rebuild the CFG for register allocation.
+        ir_module.main.instructions = vec![
+            IrInst::Label(IrLabel(0)),
+            IrInst::LoadConst {
+                dst: IrVar(10),
+                val: IrConstant::Int(BigInt::from(99)),
+            },
+            IrInst::LoadConst {
+                dst: IrVar(11),
+                val: IrConstant::Int(BigInt::from(1)),
+            },
+            IrInst::BinOp {
+                dst: IrVar(12),
+                op: IrBinaryOp::Add,
+                lhs: IrVar(10),
+                rhs: IrVar(11),
+            },
+            IrInst::Return(vec![IrVar(12)]),
+        ];
+
+        assert!(
+            !ir_module
+                .main
+                .cfg
+                .as_ref()
+                .unwrap()
+                .matches_flat_instructions(&ir_module.main.instructions)
+        );
+        let proto = ir_to_bytecode(&ir_module).expect("codegen failed");
+        let mut vm = VM::new();
+        let val = vm.execute(proto).expect("exec failed");
+        assert_eq!(val.to_string(), "100");
     }
 }
