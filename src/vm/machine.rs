@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 
 use num_integer::Integer as _;
-use num_traits::Signed as _;
 
 use crate::bytecode::instruction::{Instruction, MULTRET};
 use crate::bytecode::proto::Proto;
@@ -1207,26 +1206,62 @@ impl VM {
         // generic evaluator (bignums, mixed types, errors); a table
         // operand goes through its metamethod.
         macro_rules! arith {
-                ($dst:expr, $a:expr, $b:expr, $checked:ident, $fop:tt, $slow:path, $event:literal) => {{
-                    let ra = &reg!($a);
-                    let rb = &reg!($b);
-                    match (ra, rb) {
-                        (Value::Int(x), Value::Int(y)) => match x.$checked(*y) {
-                            Some(r) => {
-                                let slot = slot_mut(&mut self.stack, base + $dst as usize);
-                                if let Value::Int(old) = slot {
-                                    *old = r;
-                                } else {
-                                    *slot = Value::Int(r);
-                                }
+            ($dst:expr, $a:expr, $b:expr, $checked:ident, $fop:tt, $slow:path, $event:literal) => {
+                arith!(@impl $dst, $a, $b, $checked, $fop, $slow, $event, {
+                    let res = attempt!($slow(&reg!($a), &reg!($b)));
+                    set!($dst, res);
+                })
+            };
+            ($dst:expr, $a:expr, $b:expr, $checked:ident, $fop:tt, $slow:path, $event:literal, into $into:path) => {
+                arith!(@impl $dst, $a, $b, $checked, $fop, $slow, $event, {
+                    attempt!($into(
+                        &mut self.stack,
+                        base + $dst as usize,
+                        base + $a as usize,
+                        base + $b as usize,
+                    ));
+                })
+            };
+            (@impl $dst:expr, $a:expr, $b:expr, $checked:ident, $fop:tt, $slow:path, $event:literal, $fallback:block) => {{
+                let ra = &reg!($a);
+                let rb = &reg!($b);
+                match (ra, rb) {
+                    (Value::Int(x), Value::Int(y)) => match x.$checked(*y) {
+                        Some(r) => {
+                            let slot = slot_mut(&mut self.stack, base + $dst as usize);
+                            if let Value::Int(old) = slot {
+                                *old = r;
+                            } else {
+                                *slot = Value::Int(r);
                             }
-                            None => {
-                                let res = attempt!($slow(ra, rb));
-                                set!($dst, res);
-                            }
-                        },
-                        (Value::Float(x), Value::Float(y)) => {
-                            let r = x $fop y;
+                        }
+                        None => {
+                            let res = attempt!($slow(ra, rb));
+                            set!($dst, res);
+                        }
+                    },
+                    (Value::Float(x), Value::Float(y)) => {
+                        let r = x $fop y;
+                        let slot = slot_mut(&mut self.stack, base + $dst as usize);
+                        if let Value::Float(old) = slot {
+                            *old = r;
+                        } else {
+                            *slot = Value::Float(r);
+                        }
+                    }
+                    (Value::Table(_), _) | (_, Value::Table(_)) => {
+                        if let Some(mm) = self.get_binop_metamethod(ra, rb, $event) {
+                            let (va, vb) = (ra.clone(), rb.clone());
+                            sync_ip!();
+                            self.call_binop_mm(mm, va, vb, base, $dst)?;
+                            continue;
+                        }
+                        let res = attempt!($slow(ra, rb));
+                        set!($dst, res);
+                    }
+                    _ => match (ra, rb) {
+                        (Value::Int(x), Value::Float(y)) => {
+                            let r = *x as f64 $fop *y;
                             let slot = slot_mut(&mut self.stack, base + $dst as usize);
                             if let Value::Float(old) = slot {
                                 *old = r;
@@ -1234,43 +1269,20 @@ impl VM {
                                 *slot = Value::Float(r);
                             }
                         }
-                        (Value::Table(_), _) | (_, Value::Table(_)) => {
-                            if let Some(mm) = self.get_binop_metamethod(ra, rb, $event) {
-                                let (va, vb) = (ra.clone(), rb.clone());
-                                sync_ip!();
-                                self.call_binop_mm(mm, va, vb, base, $dst)?;
-                                continue;
+                        (Value::Float(x), Value::Int(y)) => {
+                            let r = *x $fop *y as f64;
+                            let slot = slot_mut(&mut self.stack, base + $dst as usize);
+                            if let Value::Float(old) = slot {
+                                *old = r;
+                            } else {
+                                *slot = Value::Float(r);
                             }
-                            let res = attempt!($slow(ra, rb));
-                            set!($dst, res);
                         }
-                        _ => match (ra, rb) {
-                            (Value::Int(x), Value::Float(y)) => {
-                                let r = *x as f64 $fop *y;
-                                let slot = slot_mut(&mut self.stack, base + $dst as usize);
-                                if let Value::Float(old) = slot {
-                                    *old = r;
-                                } else {
-                                    *slot = Value::Float(r);
-                                }
-                            }
-                            (Value::Float(x), Value::Int(y)) => {
-                                let r = *x $fop *y as f64;
-                                let slot = slot_mut(&mut self.stack, base + $dst as usize);
-                                if let Value::Float(old) = slot {
-                                    *old = r;
-                                } else {
-                                    *slot = Value::Float(r);
-                                }
-                            }
-                            _ => {
-                                let res = attempt!($slow(ra, rb));
-                                set!($dst, res);
-                            }
-                        },
-                    }
-                }};
-            }
+                        _ => $fallback,
+                    },
+                }
+            }};
+        }
         // Arithmetic without an inline fast path (division, modulo,
         // power): straight to the evaluator, metamethods first.
         macro_rules! arith_slow {
@@ -1739,10 +1751,28 @@ impl VM {
                     }
                 }
                 Instruction::Add { dst, a, b } => {
-                    arith!(dst, a, b, checked_add, +, ops::eval_add, "__add")
+                    arith!(
+                        dst,
+                        a,
+                        b,
+                        checked_add,
+                        +,
+                        ops::eval_add,
+                        "__add",
+                        into ops::eval_add_into
+                    )
                 }
                 Instruction::Sub { dst, a, b } => {
-                    arith!(dst, a, b, checked_sub, -, ops::eval_sub, "__sub")
+                    arith!(
+                        dst,
+                        a,
+                        b,
+                        checked_sub,
+                        -,
+                        ops::eval_sub,
+                        "__sub",
+                        into ops::eval_sub_into
+                    )
                 }
                 Instruction::Mul { dst, a, b } => {
                     arith!(dst, a, b, checked_mul, *, ops::eval_mul, "__mul")
@@ -1799,36 +1829,51 @@ impl VM {
                 Instruction::BitAnd { dst, a, b } => {
                     let ra = &reg!(a);
                     let rb = &reg!(b);
-                    let res = match (ra, rb) {
-                        (Value::Int(x), Value::Int(y)) => Value::Int(x & y),
-                        _ => attempt!(ops::eval_bitand(ra, rb)),
-                    };
-                    set!(dst, res);
+                    if let (Value::Int(x), Value::Int(y)) = (ra, rb) {
+                        set!(dst, Value::Int(x & y));
+                    } else {
+                        attempt!(ops::eval_bitand_into(
+                            &mut self.stack,
+                            base + dst as usize,
+                            base + a as usize,
+                            base + b as usize,
+                        ));
+                    }
                 }
                 Instruction::BitOr { dst, a, b } => {
                     let ra = &reg!(a);
                     let rb = &reg!(b);
-                    let res = match (ra, rb) {
-                        (Value::Int(x), Value::Int(y)) => Value::Int(x | y),
-                        _ => attempt!(ops::eval_bitor(ra, rb)),
-                    };
-                    set!(dst, res);
+                    if let (Value::Int(x), Value::Int(y)) = (ra, rb) {
+                        set!(dst, Value::Int(x | y));
+                    } else {
+                        attempt!(ops::eval_bitor_into(
+                            &mut self.stack,
+                            base + dst as usize,
+                            base + a as usize,
+                            base + b as usize,
+                        ));
+                    }
                 }
                 Instruction::BitXor { dst, a, b } => {
                     let ra = &reg!(a);
                     let rb = &reg!(b);
-                    let res = match (ra, rb) {
-                        (Value::Int(x), Value::Int(y)) => Value::Int(x ^ y),
-                        _ => attempt!(ops::eval_bitxor(ra, rb)),
-                    };
-                    set!(dst, res);
+                    if let (Value::Int(x), Value::Int(y)) = (ra, rb) {
+                        set!(dst, Value::Int(x ^ y));
+                    } else {
+                        attempt!(ops::eval_bitxor_into(
+                            &mut self.stack,
+                            base + dst as usize,
+                            base + a as usize,
+                            base + b as usize,
+                        ));
+                    }
                 }
                 Instruction::Shl { dst, a, b } => {
                     let ra = &reg!(a);
                     let rb = &reg!(b);
-                    let res = match (ra, rb) {
+                    match (ra, rb) {
                         (Value::Int(x), Value::Int(y)) if *x >= 0 && *y >= 0 => {
-                            if *x == 0 {
+                            let res = if *x == 0 {
                                 Value::Int(0)
                             } else {
                                 let headroom = x.leading_zeros().saturating_sub(1) as i64;
@@ -1849,44 +1894,55 @@ impl VM {
                                         attempt!(ops::eval_shl(ra, rb))
                                     }
                                 }
-                            }
+                            };
+                            set!(dst, res);
                         }
-                        (Value::BigInt(x), Value::Int(y)) if *y >= 0 => {
-                            if (*y as u64) <= ops::MAX_INT_BITS
-                                && x.bits().saturating_add(*y as u64) <= ops::MAX_INT_BITS
-                            {
-                                Value::BigInt(std::rc::Rc::new(&**x << (*y as usize)))
-                            } else {
-                                attempt!(ops::eval_shl(ra, rb))
-                            }
+                        (Value::BigInt(_), Value::Int(y)) if *y >= 0 => {
+                            let shift = *y as u64;
+                            attempt!(ops::eval_shl_bigint_into(
+                                &mut self.stack,
+                                base + dst as usize,
+                                base + a as usize,
+                                shift,
+                            ));
                         }
-                        _ => attempt!(ops::eval_shl(ra, rb)),
-                    };
-                    set!(dst, res);
+                        _ => {
+                            let res = attempt!(ops::eval_shl(ra, rb));
+                            set!(dst, res);
+                        }
+                    }
                 }
                 Instruction::Shr { dst, a, b } => {
                     let ra = &reg!(a);
                     let rb = &reg!(b);
-                    let res = match (ra, rb) {
+                    match (ra, rb) {
                         (Value::Int(x), Value::Int(y)) => {
                             if *y < 0 {
-                                attempt!(ops::eval_shl(ra, rb))
-                            } else if *y >= 64 {
-                                Value::Int(if *x < 0 { -1 } else { 0 })
+                                let res = attempt!(ops::eval_shl(ra, rb));
+                                set!(dst, res);
                             } else {
-                                Value::Int(x >> *y)
+                                let res = if *y >= 64 {
+                                    Value::Int(if *x < 0 { -1 } else { 0 })
+                                } else {
+                                    Value::Int(x >> *y)
+                                };
+                                set!(dst, res);
                             }
                         }
-                        (Value::BigInt(x), Value::Int(y)) if *y >= 0 => {
-                            if (*y as u64) >= x.bits() {
-                                Value::Int(if x.is_negative() { -1 } else { 0 })
-                            } else {
-                                Value::from_bigint(&**x >> (*y as usize))
-                            }
+                        (Value::BigInt(_), Value::Int(y)) if *y >= 0 => {
+                            let shift = *y as u64;
+                            ops::eval_shr_bigint_into(
+                                &mut self.stack,
+                                base + dst as usize,
+                                base + a as usize,
+                                shift,
+                            );
                         }
-                        _ => attempt!(ops::eval_shr(ra, rb)),
-                    };
-                    set!(dst, res);
+                        _ => {
+                            let res = attempt!(ops::eval_shr(ra, rb));
+                            set!(dst, res);
+                        }
+                    }
                 }
 
                 Instruction::LShl { dst, a, b } => {
@@ -1942,9 +1998,9 @@ impl VM {
                 }
                 Instruction::Unm { dst, src } => {
                     let v = &reg!(src);
-                    let res = match v {
-                        Value::Int(i) if *i != i64::MIN => Value::Int(-i),
-                        Value::Float(f) => Value::Float(-f),
+                    match v {
+                        Value::Int(i) if *i != i64::MIN => set!(dst, Value::Int(-i)),
+                        Value::Float(f) => set!(dst, Value::Float(-f)),
                         Value::Table(_) => {
                             if let Some(mm) = self.get_unop_metamethod(v, "__unm") {
                                 let v = v.clone();
@@ -1955,9 +2011,12 @@ impl VM {
                             }
                             throw!("unary minus expects a number");
                         }
-                        _ => attempt!(ops::eval_unm(v)),
-                    };
-                    set!(dst, res);
+                        _ => attempt!(ops::eval_unm_into(
+                            &mut self.stack,
+                            base + dst as usize,
+                            base + src as usize,
+                        )),
+                    }
                 }
                 Instruction::Not { dst, src } => {
                     let truthy = reg!(src).is_truthy();
