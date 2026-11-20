@@ -144,6 +144,10 @@ pub struct GcTracker {
     pub sweep_doomed_buffers: FxHashSet<*const RefCell<VmBuffer>>,
     pub sweep_freed: usize,
     pub sweeping: bool,
+    /// Consecutive nursery-only reaps since the last full cycle collection,
+    /// bounded so even small unreachable cycles or pending `__gc`/weak entries
+    /// are still collected promptly under steady acyclic churn.
+    pub nursery_reaps_since_cycle: u8,
 }
 
 /// Sweep work extracted for the driver: plain garbage to clear, the
@@ -190,6 +194,7 @@ impl GcTracker {
             sweep_doomed_buffers: FxHashSet::default(),
             sweep_freed: 0,
             sweeping: false,
+            nursery_reaps_since_cycle: 0,
         }
     }
 
@@ -219,29 +224,43 @@ impl GcTracker {
         self.young.push((Rc::downgrade(rc), size, alloc_id));
     }
 
-    /// Moves the young tables that are still alive into `tables` and
-    /// returns the bytes of those that already died.
-    pub fn flush_young(&mut self) -> usize {
+    /// Drains `young`, dropping entries already freed by refcounting and
+    /// promoting every surviving entry into `tables` so survivors are never
+    /// rescanned on subsequent nursery reaps. Returns the bytes dropped
+    /// without mutating `bytes_allocated`.
+    fn drain_young(&mut self) -> usize {
         let mut dropped = 0;
-        self.young.retain(|(weak, size, _)| {
-            if weak.strong_count() == 0 {
-                dropped += *size;
-                false
-            } else {
-                true
-            }
-        });
-        self.tables.reserve(self.young.len());
         for (weak, size, alloc_id) in self.young.drain(..) {
-            let header = GcHeader {
-                color: self.current_white,
-                size,
-                alloc_id,
-                finalized: false,
-            };
-            self.tables.insert(weak.as_ptr(), (weak, header));
+            if weak.strong_count() == 0 {
+                dropped += size;
+            } else {
+                let header = GcHeader {
+                    color: self.current_white,
+                    size,
+                    alloc_id,
+                    finalized: false,
+                };
+                self.tables.insert(weak.as_ptr(), (weak, header));
+            }
         }
         dropped
+    }
+
+    /// Reaps dead nursery entries and promotes survivors into `tables`,
+    /// subtracting the reclaimed bytes from `bytes_allocated`. Safe even when
+    /// `__gc` tables or weak tables exist because any live or pinned entry
+    /// still has `strong_count > 0` and is promoted rather than dropped.
+    pub fn reap_young(&mut self) -> usize {
+        let dropped = self.drain_young();
+        self.bytes_allocated = self.bytes_allocated.saturating_sub(dropped);
+        dropped
+    }
+
+    /// Moves the young tables that are still alive into `tables` and
+    /// returns the bytes of those that already died (left for `sweep_begin`
+    /// to subtract from `bytes_allocated`).
+    pub fn flush_young(&mut self) -> usize {
+        self.drain_young()
     }
 
     pub fn register_buffer(&mut self, rc: &Rc<RefCell<VmBuffer>>) {
@@ -429,23 +448,34 @@ impl GcTracker {
         }
         // From here the state stays Sweep until `sweep_finish`, which also
         // makes nested collections back out instead of re-entering.
-        // Tables that refcounting already freed only need their entry gone,
-        // which also releases the memory their weak handle still holds.
-        self.tables.retain(|_, (weak_rc, header)| {
-            let live = weak_rc.strong_count() > 0;
-            if !live {
-                dropped += header.size;
-            }
-            live
-        });
+        // Drop entries refcounting already freed and collect remaining white
+        // candidates in one pass over `self.tables`.
         let mut white_tables: FxHashMap<*const RefCell<VmTable>, Rc<RefCell<VmTable>>> =
             FxHashMap::default();
-        for (&ptr, (weak_rc, header)) in &self.tables {
-            if (header.color == GcColor::White0 || header.color == GcColor::White1)
-                && let Some(rc) = weak_rc.upgrade()
-            {
-                white_tables.insert(ptr, rc);
+        self.tables.retain(|&ptr, (weak_rc, header)| {
+            if header.color == GcColor::White0 || header.color == GcColor::White1 {
+                if let Some(rc) = weak_rc.upgrade() {
+                    white_tables.insert(ptr, rc);
+                    true
+                } else {
+                    dropped += header.size;
+                    false
+                }
+            } else {
+                let live = weak_rc.strong_count() > 0;
+                if !live {
+                    dropped += header.size;
+                }
+                live
             }
+        });
+        if white_tables.is_empty() {
+            return SweepPlan {
+                plain: Vec::new(),
+                dropped,
+                queue: Vec::new(),
+                internal: FxHashMap::default(),
+            };
         }
 
         // Count internal references between candidate white tables, plus
@@ -700,6 +730,7 @@ impl GcTracker {
         settled_cleared: Vec<*const RefCell<VmTable>>,
         settled_freed: usize,
     ) {
+        self.nursery_reaps_since_cycle = 0;
         self.bytes_allocated = self.bytes_allocated.saturating_sub(dropped);
         let mut doomed_tables: FxHashSet<*const RefCell<VmTable>> = FxHashSet::default();
         for ptr in settled_cleared {
@@ -1124,5 +1155,53 @@ mod tests {
         assert!(gc.sweep_slice(usize::MAX));
         assert!(!gc.sweeping);
         assert_eq!(gc.state, GCState::Pause);
+    }
+
+    #[test]
+    fn test_gc_reap_young_reclaims_acyclic_and_preserves_cycles() {
+        let mut gc = GcTracker::new();
+        let stack = Vec::new();
+        let globals = crate::vm::hash::new_map();
+
+        // 10 acyclic tables that immediately drop via Rc refcounting.
+        for _ in 0..10 {
+            let tmp = Rc::new(RefCell::new(VmTable::new()));
+            gc.register_table(&tmp);
+        }
+        // 1 surviving live table + 1 unreachable 2-node cycle.
+        let live = Rc::new(RefCell::new(VmTable::new()));
+        gc.register_table(&live);
+
+        let cyc_a = Rc::new(RefCell::new(VmTable::new()));
+        let cyc_b = Rc::new(RefCell::new(VmTable::new()));
+        gc.register_table(&cyc_a);
+        gc.register_table(&cyc_b);
+        cyc_a
+            .borrow_mut()
+            .set_str("peer", Value::Table(cyc_b.clone()));
+        cyc_b
+            .borrow_mut()
+            .set_str("peer", Value::Table(cyc_a.clone()));
+        drop(cyc_a);
+        drop(cyc_b);
+
+        assert_eq!(gc.young.len(), 13);
+        let before = gc.bytes_allocated;
+
+        // Reaping young frees the 10 dead acyclic entries and promotes the 3
+        // surviving tables (live + 2-node cycle) into `tables`, emptying
+        // `young` so survivors are never rescanned on later nursery reaps.
+        let dropped = gc.reap_young();
+        assert_eq!(dropped, 10 * 64);
+        assert_eq!(gc.bytes_allocated, before - dropped);
+        assert!(gc.young.is_empty());
+        assert_eq!(gc.tables.len(), 3);
+
+        // Subsequent full collection still collects the 2-node cycle and keeps `live`.
+        let mut stack_with_live = stack;
+        stack_with_live.push(Value::Table(live.clone()));
+        let freed = collect_all(&mut gc, &stack_with_live, &globals);
+        assert_eq!(freed, 2 * 64);
+        assert_eq!(tracked(&gc), 1);
     }
 }

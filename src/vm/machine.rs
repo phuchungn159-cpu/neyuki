@@ -945,6 +945,20 @@ impl VM {
         if !self.gc.should_collect() {
             return Ok(());
         }
+        // Reap dead acyclic tables from the nursery and promote survivors into
+        // `tables` (safe even when `__gc` or weak tables exist, since pinned
+        // and referenced entries keep `strong_count > 0`). Skip the full cycle
+        // collector only while total occupancy stays comfortably below the
+        // threshold and consecutive nursery-only reaps remain bounded.
+        let dropped = self.gc.reap_young();
+        if dropped > 0
+            && self.gc.bytes_allocated <= self.gc.threshold * 3 / 4
+            && self.gc.nursery_reaps_since_cycle < 4
+        {
+            self.gc.nursery_reaps_since_cycle += 1;
+            self.gc.last_freed = dropped;
+            return Ok(());
+        }
         let crate::vm::gc::SweepPlan {
             queue,
             internal,
@@ -1638,24 +1652,10 @@ impl VM {
                         let mut tbl = t.borrow_mut();
                         if !tbl.frozen {
                             if tbl.metatable.is_none() {
-                                if let Some(slot) = tbl.fields.get_mut_by_strref(s) {
-                                    match (v, slot) {
-                                        (Value::Int(n), Value::Int(o)) => *o = *n,
-                                        (Value::Float(n), Value::Float(o)) => *o = *n,
-                                        (Value::Bool(n), Value::Bool(o)) => *o = *n,
-                                        (val, slot) => *slot = val.clone(),
-                                    }
-                                } else {
-                                    tbl.fields.insert(s.clone(), v.clone());
-                                }
+                                tbl.fields.set_by_strref(s, v);
                                 continue;
                             } else if let Some(slot) = tbl.fields.get_mut_by_strref(s) {
-                                match (v, slot) {
-                                    (Value::Int(n), Value::Int(o)) => *o = *n,
-                                    (Value::Float(n), Value::Float(o)) => *o = *n,
-                                    (Value::Bool(n), Value::Bool(o)) => *o = *n,
-                                    (val, slot) => *slot = val.clone(),
-                                }
+                                crate::vm::table::assign_value(slot, v);
                                 continue;
                             }
                         }
@@ -1676,24 +1676,10 @@ impl VM {
                         let mut tbl = t.borrow_mut();
                         if !tbl.frozen {
                             if tbl.metatable.is_none() {
-                                if let Some(slot) = tbl.fields.get_mut_by_strref(s) {
-                                    match (v, slot) {
-                                        (Value::Int(n), Value::Int(o)) => *o = *n,
-                                        (Value::Float(n), Value::Float(o)) => *o = *n,
-                                        (Value::Bool(n), Value::Bool(o)) => *o = *n,
-                                        (val, slot) => *slot = val.clone(),
-                                    }
-                                } else {
-                                    tbl.fields.insert(s.clone(), v.clone());
-                                }
+                                tbl.fields.set_by_strref(s, v);
                                 continue;
                             } else if let Some(slot) = tbl.fields.get_mut_by_strref(s) {
-                                match (v, slot) {
-                                    (Value::Int(n), Value::Int(o)) => *o = *n,
-                                    (Value::Float(n), Value::Float(o)) => *o = *n,
-                                    (Value::Bool(n), Value::Bool(o)) => *o = *n,
-                                    (val, slot) => *slot = val.clone(),
-                                }
+                                crate::vm::table::assign_value(slot, v);
                                 continue;
                             }
                         }
@@ -2516,61 +2502,72 @@ impl VM {
     /// The generic-for step. `b` is the loop's base register: iterator,
     /// state, control, then the loop variables.
     fn tfor_call(&mut self, base: usize, b: u8, retc: u8) -> Result<(), String> {
-        let iter_fn = self.stack[base + b as usize].clone();
-        let state = self.stack[base + b as usize + 1].clone();
-        let ctrl = self.stack[base + b as usize + 2].clone();
-        let results = match &iter_fn {
-            Value::Table(t) if t.borrow().metamethod("__call").is_none() => {
-                let t = t.clone();
-                self.table_for_step(&t, base + b as usize + 1, retc)
-            }
-            // `pairs(t)` hands back `next`: iterate the table directly,
-            // which visits every key once without re-sorting per step.
-            Value::Native(def)
-                if std::ptr::eq(*def, crate::vm::builtins::NEXT) && matches!(ctrl, Value::Nil) =>
-            {
-                match &state {
-                    Value::Table(t) => {
-                        let t = t.clone();
-                        self.stack[base + b as usize] = state.clone();
-                        self.stack[base + b as usize + 1] = Value::Nil;
-                        self.table_for_step(&t, base + b as usize + 1, retc)
-                    }
-                    _ => self.call_function(iter_fn, &[state, ctrl])?,
-                }
-            }
-            _ => self.call_function(iter_fn, &[state, ctrl])?,
-        };
-        let var_base = base + b as usize + 3;
-        if var_base + retc as usize > self.stack.len() {
-            self.stack.resize(var_base + retc as usize, Value::Nil);
+        let iter_idx = base + b as usize;
+        let var_base = iter_idx + 3;
+        let retc_usize = retc as usize;
+        if var_base + retc_usize > self.stack.len() {
+            self.stack.resize(var_base + retc_usize, Value::Nil);
         }
-        for i in 0..(retc as usize) {
+
+        // Fast path: direct iteration over a plain table (`for k, v in t`) or
+        // after `pairs(t)` rewrites the iterator slot to the table on step 1.
+        let direct_table = match &self.stack[iter_idx] {
+            Value::Table(t) => t.borrow().metamethod("__call").is_none(),
+            Value::Native(def)
+                if std::ptr::eq(*def, crate::vm::builtins::NEXT)
+                    && matches!(self.stack[iter_idx + 2], Value::Nil)
+                    && matches!(self.stack[iter_idx + 1], Value::Table(_)) =>
+            {
+                let tbl = std::mem::replace(&mut self.stack[iter_idx + 1], Value::Nil);
+                self.stack[iter_idx] = tbl;
+                true
+            }
+            _ => false,
+        };
+        if direct_table {
+            let (head, tail) = self.stack.split_at_mut(iter_idx + 1);
+            if let Value::Table(t) = &head[iter_idx] {
+                let (state_slice, rest) = tail.split_at_mut(2);
+                Self::table_for_step_into(t, &mut state_slice[0], &mut rest[..retc_usize]);
+                return Ok(());
+            }
+        }
+
+        let iter_fn = self.stack[iter_idx].clone();
+        let state = self.stack[iter_idx + 1].clone();
+        let ctrl = self.stack[iter_idx + 2].clone();
+        let results = self.call_function(iter_fn, &[state, ctrl])?;
+        if var_base + retc_usize > self.stack.len() {
+            self.stack.resize(var_base + retc_usize, Value::Nil);
+        }
+        for i in 0..retc_usize {
             self.stack[var_base + i] = results.get(i).cloned().unwrap_or(Value::Nil);
         }
         Ok(())
     }
 
-    /// One step of `for k, v in t`. The state register holds the progress:
-    /// nil before the first step, an integer while walking the array part,
-    /// then a snapshot of the remaining keys (stored reversed, popped from
-    /// the end). Entries removed during the loop are skipped; keys added
-    /// after the snapshot are not visited.
-    fn table_for_step(
-        &mut self,
-        t: &Rc<RefCell<VmTable>>,
-        state_reg: usize,
-        retc: u8,
-    ) -> Vec<Value> {
-        let entry = |key: Value, value: Value| {
-            if retc > 1 {
-                vec![key, value]
-            } else {
-                vec![value]
+    /// One step of `for k, v in t`, writing results straight into `vars` with
+    /// zero intermediate allocations. `state_slot` holds the progress: nil
+    /// before the first step, an integer while walking the array part, then a
+    /// snapshot of the remaining keys (stored reversed, popped from the end).
+    /// Entries removed during the loop are skipped; keys added after the
+    /// snapshot are not visited.
+    fn table_for_step_into(t: &RefCell<VmTable>, state_slot: &mut Value, vars: &mut [Value]) {
+        #[inline]
+        fn write_entry(vars: &mut [Value], key: Value, value: Value) {
+            if vars.len() > 1 {
+                vars[0] = key;
+                vars[1] = value;
+                for slot in &mut vars[2..] {
+                    *slot = Value::Nil;
+                }
+            } else if let Some(slot) = vars.first_mut() {
+                *slot = value;
             }
-        };
+        }
+
         let tbl = t.borrow();
-        let mut next_index = match &self.stack[state_reg] {
+        let mut next_index = match state_slot {
             Value::Int(i) => *i as usize,
             Value::Table(_) => usize::MAX,
             _ => 0,
@@ -2581,33 +2578,48 @@ impl VM {
             if !matches!(v, Value::Nil) {
                 let v = v.clone();
                 drop(tbl);
-                self.stack[state_reg] = Value::from_usize(next_index);
-                return entry(Value::from_usize(next_index), v);
+                let idx_val = Value::from_usize(next_index);
+                *state_slot = idx_val.clone();
+                write_entry(vars, idx_val, v);
+                return;
             }
         }
-        let snapshot = match &self.stack[state_reg] {
-            Value::Table(snapshot) => snapshot.clone(),
+        let snapshot = match state_slot {
+            Value::Table(snapshot) => snapshot,
             _ => {
                 if tbl.fields.is_empty() && tbl.general.is_none() {
-                    return vec![Value::Nil];
+                    drop(tbl);
+                    for slot in vars {
+                        *slot = Value::Nil;
+                    }
+                    return;
                 }
                 let mut keys = crate::vm::table::sorted_keys(&tbl);
                 keys.reverse();
                 let mut snapshot = VmTable::new();
                 snapshot.array = keys;
-                let snapshot = Rc::new(RefCell::new(snapshot));
-                self.stack[state_reg] = Value::Table(snapshot.clone());
-                snapshot
+                *state_slot = Value::Table(Rc::new(RefCell::new(snapshot)));
+                match state_slot {
+                    Value::Table(s) => s,
+                    _ => unreachable!("just assigned Value::Table"),
+                }
             }
         };
         let mut snapshot = snapshot.borrow_mut();
         while let Some(key) = snapshot.array.pop() {
             let value = tbl.raw_get(&key);
             if !matches!(value, Value::Nil) {
-                return entry(key, value);
+                drop(snapshot);
+                drop(tbl);
+                write_entry(vars, key, value);
+                return;
             }
         }
-        vec![Value::Nil]
+        drop(snapshot);
+        drop(tbl);
+        for slot in vars {
+            *slot = Value::Nil;
+        }
     }
 
     // ----- tables ---------------------------------------------------------
@@ -2669,11 +2681,11 @@ impl VM {
                 }
             }
             Value::String(k) => {
-                if let Some(slot) = tbl.fields.get_mut_by_strref(k) {
-                    *slot = val.clone();
+                if tbl.metatable.is_none() {
+                    tbl.fields.set_by_strref(k, val);
                     true
-                } else if tbl.metatable.is_none() {
-                    tbl.fields.insert(k.clone(), val.clone());
+                } else if let Some(slot) = tbl.fields.get_mut_by_strref(k) {
+                    *slot = val.clone();
                     true
                 } else {
                     false
